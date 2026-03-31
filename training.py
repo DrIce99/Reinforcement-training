@@ -2,11 +2,26 @@ import pygame
 import numpy as np
 import math
 import random
+import pickle
+import os
 
 # --- CONFIG ---
 WIDTH, HEIGHT = 800, 600
 POP_SIZE = 30
 SENSOR_COUNT = 5
+
+# LOGICA DI SALVATAGGIO ---
+def save_model(brain):
+    with open("best_brain.pkl", "wb") as f:
+        pickle.dump(brain.weights, f)
+    print(">>> Progresso salvato in best_brain.pkl")
+
+def load_model():
+    if os.path.exists("best_brain.pkl"):
+        with open("best_brain.pkl", "rb") as f:
+            print(">>> Modello precedente caricato con successo!")
+            return pickle.load(f)
+    return None
 
 # --- BRAIN ---
 class Brain:
@@ -68,70 +83,74 @@ def get_sensors(pos, angle, track):
 # --- SIMULAZIONE ---
 def run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle):
     running = True
+    finish_count = 0 # Conta quanti hanno finito il giro
+    frame_count = 0  # Timer della simulazione
 
     for brain in population:
         brain.reset(spawn_pos, base_angle)
-        brain.completed = False
 
     while running:
+        frame_count += 1
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit()
-                exit()
+                pygame.quit(); exit()
 
         screen.blit(track, (0, 0))
-
         alive_count = 0
 
         for brain in population:
-            if not brain.alive:
+            if not brain.alive or brain.completed:
                 continue
 
             alive_count += 1
-
             sensors = get_sensors(brain.pos, brain.angle, track)
             action = brain.predict(sensors)
 
+            # Decisioni: action[0] = sterzo, action[1] = velocità
             steer = action[0] * 5
-            speed = max(2, (action[1] + 1) * 2)
+            speed = max(1, (action[1] + 1) * 4) # Velocità da 1 a 8
 
             brain.angle += steer
             rad = math.radians(brain.angle)
-
             old_pos = brain.pos.copy()
             brain.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * speed
             
-            dist_moved = old_pos.distance_to(brain.pos)
-            brain.score += dist_moved
+            # Punteggio base per il movimento
+            brain.score += old_pos.distance_to(brain.pos)
+            # Penale tempo: più tempo passi in pista, meno punti fai
+            brain.score -= 0.1 
 
+            # --- LOGICA TRAGUARDO (Classifica) ---
             dist_to_start = brain.pos.distance_to(spawn_pos)
             if brain.score > 500 and dist_to_start < 30:
-                brain.score += 5000 # Bonus enorme
+                finish_count += 1
+                # Il bonus decresce in base al tempo (frame_count)
+                # Più è basso frame_count, più è alto il bonus
+                bonus = max(1000, 10000 - frame_count * 2) 
+                brain.score += bonus
                 brain.completed = True
-                print(f"PALLINO HA COMPLETATO IL GIRO! Passaggio alla Gen {generation + 1}")
-                return
+                print(f"Pilota {population.index(brain)} ARRIVATO! Posizione: {finish_count}")
 
-            # collisione
+            # --- COLLISIONE ---
             try:
-                color = track.get_at((int(brain.pos.x), int(brain.pos.y)))
-                if color == (0, 0, 0, 255):
+                if track.get_at((int(brain.pos.x), int(brain.pos.y))).r < 30:
                     brain.alive = False
-                    brain.score -= 10
+                    brain.score -= 50 # Penalità pesante per chi sbatte
             except:
                 brain.alive = False
 
-            pygame.draw.circle(screen, (255, 0, 0),
-                               (int(brain.pos.x), int(brain.pos.y)), 4)
+            color = (255, 0, 0) if brain.alive else (100, 100, 100)
+            pygame.draw.circle(screen, color, (int(brain.pos.x), int(brain.pos.y)), 4)
 
-        text = font.render(f"Gen: {generation} | Alive: {alive_count}", True, (0,255,0))
-        screen.blit(text, (10, 10))
-
-        pygame.display.flip()
-        clock.tick(60)
-
+        # Se tutti sono morti o hanno finito, chiudiamo la generazione
         if alive_count == 0:
             running = False
 
+        # Disegno info
+        txt = font.render(f"Gen: {generation} | Vivi: {alive_count} | Arrivati: {finish_count}", True, (0,255,0))
+        screen.blit(txt, (10, 10))
+        pygame.display.flip()
+        clock.tick(120) # Aumentato a 120 per velocizzare l'allenamento visivo
 
 # --- EVOLUZIONE ---
 def evolve(population, spawn_pos, base_angle):
@@ -163,13 +182,19 @@ def main():
     
     spawn_pos = find_spawn(track)
     base_angle = -135
+    
+    generation = 0 
+    
+    saved_weights = load_model()
 
     population = [Brain(spawn_pos, base_angle) for _ in range(POP_SIZE)]
-
-    generation = 0
+    if saved_weights is not None:
+        population[0].weights = saved_weights
 
     while True:
         run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle)
+        # Salva il migliore di ogni generazione automaticamente
+        save_model(population[0]) 
         population = evolve(population, spawn_pos, base_angle)
         generation += 1
 
