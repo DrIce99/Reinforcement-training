@@ -6,7 +6,7 @@ import pickle
 import os
 
 # --- CONFIG ---
-WIDTH, HEIGHT = 800, 600
+# WIDTH, HEIGHT = 800, 600
 POP_SIZE = 30
 SENSOR_COUNT = 5
 
@@ -101,7 +101,7 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
         alive_count = 0
 
         for brain in population:
-            if not brain.alive:
+            if not brain.alive or brain.completed:
                 continue
 
             alive_count += 1
@@ -125,7 +125,7 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
             target_cp = checkpoints[brain.next_cp]
             dist_to_cp = brain.pos.distance_to(pygame.Vector2(target_cp))
             
-            if dist_to_cp < 50: 
+            if dist_to_cp < 70: 
                 brain.score += 5000 
                 brain.next_cp += 1 
 
@@ -191,11 +191,14 @@ def evolve(population, spawn_pos, base_angle):
 # --- MAIN ---
 def main():
     pygame.init()
+    # track = pygame.image.load("circuit.png").convert()
+    track_temp = pygame.image.load("pista_gara.png")
+    WIDTH, HEIGHT = track_temp.get_size()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    track = track_temp.convert()
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Arial", 20)
 
-    track = pygame.image.load("circuit.png").convert()
     track = pygame.transform.scale(track, (WIDTH, HEIGHT))
     
     try:

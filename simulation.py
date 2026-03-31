@@ -5,7 +5,7 @@ import pickle
 import os
 
 # --- CONFIGURAZIONE GARA ---
-WIDTH, HEIGHT = 800, 600
+# WIDTH, HEIGHT = 800, 600
 NUM_RACERS = 10  # Numero di partecipanti alla gara
 SENSOR_COUNT = 5
 
@@ -109,12 +109,15 @@ def main():
     LAPS_TO_WIN = 3
     
     pygame.init()
+    # track = pygame.image.load("circuit.png").convert()
+    track_temp = pygame.image.load("pista_gara.png")
+    WIDTH, HEIGHT = track_temp.get_size()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    track = track_temp.convert()
     pygame.display.set_caption("GRAN PREMIO IA - Simulazione Finale")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Arial", 18)
 
-    track = pygame.image.load("circuit.png").convert()
     spawn_pos = find_spawn(track)
     base_angle = -135 # Regola in base alla direzione del tuo circuito
 
@@ -126,10 +129,24 @@ def main():
 
     # Creazione Griglia di Partenza con colori diversi
     racers = []
+
+    BASE_COLORS = [
+        (255, 0, 0),   # Rosso
+        (0, 0, 255),   # Blu
+        (255, 255, 0), # Giallo
+        (255, 165, 0), # Arancione
+        (0, 255, 255), # Ciano
+        (255, 0, 255), # Magenta
+        (128, 0, 128), # Viola
+        (0, 128, 128), # Ottanio
+        (255, 255, 255), # Bianco
+        (200, 200, 200)  # Grigio chiaro
+    ]
+
     for i in range(NUM_RACERS):
         # Ogni pilota ha il DNA del migliore + una piccola variazione casuale (0.05)
         dna = trained_weights + np.random.normal(0, 0.05, trained_weights.shape)
-        color = (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
+        color = BASE_COLORS[i % len(BASE_COLORS)]
         # Griglia di partenza: spostiamo leggermente ogni pilota per non sovrapporli
         offset_pos = spawn_pos + pygame.Vector2(random.randint(-10, 10), random.randint(-10, 10))
         racers.append(Racer(dna, color, i+1, offset_pos, base_angle))
