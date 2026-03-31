@@ -1,59 +1,74 @@
 import pygame
 import random
 import math
+import numpy as np
+import pickle
+
+def get_bezier_point(p0, p1, p2, p3, t):
+    px = (1-t)**3 * p0[0] + 3*(1-t)**2 * t * p1[0] + 3*(1-t) * t**2 * p2[0] + t**3 * p3[0]
+    py = (1-t)**3 * p0[1] + 3*(1-t)**2 * t * p1[1] + 3*(1-t) * t**2 * p2[1] + t**3 * p3[1]
+    return (px, py)
 
 def generate_track():
     pygame.init()
     width, height = 800, 600
-    # Creiamo la superficie principale
     surface = pygame.Surface((width, height))
-
-    BLACK = (0, 0, 0)
-    WHITE = (255, 255, 255)
-    GREEN = (0, 255, 0)
-
+    BLACK, WHITE, GREEN = (0,0,0), (255,255,255), (0,255,0)
     surface.fill(BLACK)
 
-    # --- PARAMETRI DEL CIRCUITO ---
-    center = (width // 2, height // 2)
-    points = []
-    num_points = 15 # Numero di "curve" principali
-    base_radius = 200
-    track_width = 50 # Larghezza della carreggiata
+    # 1. DEFINIAMO IL RETTILINEO DI PARTENZA/ARRIVO
+    # Lo spawn sarà a metà di questo rettilineo
+    start_line_y = 100
+    p_start = (200, start_line_y)  # Inizio rettilineo
+    p_end = (600, start_line_y)    # Fine rettilineo (direzione marcia: verso destra)
+    spawn_pos = (400, start_line_y)
 
-    # --- 1. GENERA PUNTI CASUALI PER UN CIRCUITO MORBIDO ---
-    for i in range(num_points):
-        angle = (i / num_points) * 2 * math.pi
-        # Rumore casuale per rendere la pista varia ma non spezzata
-        radius = base_radius + random.randint(-70, 70)
-        
-        x = int(center[0] + math.cos(angle) * radius)
-        y = int(center[1] + math.sin(angle) * radius)
-        points.append((x, y))
+    # 2. PUNTI DI CONTROLLO CASUALI (per il resto del circuito)
+    # Creiamo un "arco" di punti che partono da p_end e tornano a p_start
+    control_points = [p_end]
+    control_points.append((750, 200))
+    control_points.append((700, 500))
+    control_points.append((400, 550))
+    control_points.append((100, 500))
+    control_points.append((50, 200))
+    control_points.append(p_start)
 
-    # Chiudiamo il loop riportando all'inizio
-    points.append(points[0])
+    # 3. GENERAZIONE PUNTI PISTA (Bézier + Rettilineo)
+    track_points = []
+    
+    # Aggiungiamo il rettilineo iniziale manualmente per essere sicuri della direzione
+    for x in np.linspace(p_start[0], p_end[0], 10):
+        track_points.append((x, start_line_y))
 
-    # --- 2. DISEGNA LA PISTA BIANCA ---
-    # Usiamo un trucco: disegniamo cerchi su ogni punto e linee spesse tra loro
-    # per evitare che rimangano "buchi" neri nelle curve strette.
-    for i in range(len(points) - 1):
-        p1 = points[i]
-        p2 = points[i+1]
-        # Disegna il segmento
-        pygame.draw.line(surface, WHITE, p1, p2, track_width)
-        # Disegna il "giunto" circolare per smussare l'angolo
-        pygame.draw.circle(surface, WHITE, p1, track_width // 2)
+    # Curve di Bézier per il resto
+    for i in range(len(control_points)-1):
+        p0 = control_points[i]
+        p3 = control_points[i+1]
+        # Punti di controllo intermedi "morbidi"
+        p1 = (p0[0] + (p3[0]-p0[0])*0.5, p0[1] + random.randint(-100,100))
+        p2 = (p3[0] - (p3[0]-p0[0])*0.5, p3[1] + random.randint(-100,100))
+        for t in np.linspace(0, 1, 15):
+            track_points.append(get_bezier_point(p0, p1, p2, p3, t))
 
-    # --- 3. POSIZIONA LO SPAWN VERDE ---
-    # Lo mettiamo sul primo punto generato (che è sicuramente sulla pista)
-    spawn_pos = points[0]
+    # 4. DISEGNA PISTA
+    track_width = 50
+    for i in range(len(track_points)-1):
+        pygame.draw.line(surface, WHITE, track_points[i], track_points[i+1], track_width)
+        pygame.draw.circle(surface, WHITE, (int(track_points[i][0]), int(track_points[i][1])), track_width//2)
+
+    # 5. CHECKPOINTS AUTOMATICI
+    checkpoints = []
+    for i in range(0, len(track_points), 12):
+        checkpoints.append((int(track_points[i][0]), int(track_points[i][1])))
+    
+    with open("checkpoints.pkl", "wb") as f:
+        pickle.dump(checkpoints, f)
+
+    # 6. SPAWN VERDE (esattamente sul rettilineo)
     pygame.draw.circle(surface, GREEN, spawn_pos, 8)
 
-    # --- 4. SALVA L'IMMAGINE ---
     pygame.image.save(surface, "circuit.png")
-    print(f"Circuito creato con successo! Spawn trovato a: {spawn_pos}")
-
+    print(f"Circuito con rettilineo creato! Direzione: DESTRA (0 gradi)")
     pygame.quit()
 
 if __name__ == "__main__":

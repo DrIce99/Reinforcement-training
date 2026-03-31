@@ -29,6 +29,8 @@ class Brain:
         self.spawn_pos = spawn_pos
         self.base_angle = base_angle
         
+        self.next_cp = 0
+        
         # Inizializza i pesi: 5 sensori in ingresso, 2 decisioni in uscita (sterzo, velocità)
         if weights is None:
             self.weights = np.random.uniform(-1, 1, (SENSOR_COUNT, 2))
@@ -81,7 +83,7 @@ def get_sensors(pos, angle, track):
 
 
 # --- SIMULAZIONE ---
-def run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle):
+def run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle, checkpoints):
     running = True
     finish_count = 0 # Conta quanti hanno finito il giro
     frame_count = 0  # Timer della simulazione
@@ -99,7 +101,7 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
         alive_count = 0
 
         for brain in population:
-            if not brain.alive or brain.completed:
+            if not brain.alive:
                 continue
 
             alive_count += 1
@@ -119,6 +121,22 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
             brain.score += old_pos.distance_to(brain.pos)
             # Penale tempo: più tempo passi in pista, meno punti fai
             brain.score -= 0.1 
+            
+            target_cp = checkpoints[brain.next_cp]
+            dist_to_cp = brain.pos.distance_to(pygame.Vector2(target_cp))
+            
+            if dist_to_cp < 50: 
+                brain.score += 5000 
+                brain.next_cp += 1 
+
+                # Se ha superato l'ultimo checkpoint della lista
+                if brain.next_cp >= len(checkpoints):
+                    brain.completed = True
+                    # Calcola bonus velocità basato sul tempo
+                    bonus_velocita = max(1000, 10000 - frame_count * 2)
+                    brain.score += bonus_velocita
+                    print(f"PALLINO ARRIVATO! Gen: {generation} | Tempo: {frame_count}")
+                    return
 
             # --- LOGICA TRAGUARDO (Classifica) ---
             dist_to_start = brain.pos.distance_to(spawn_pos)
@@ -180,6 +198,14 @@ def main():
     track = pygame.image.load("circuit.png").convert()
     track = pygame.transform.scale(track, (WIDTH, HEIGHT))
     
+    try:
+        with open("checkpoints.pkl", "rb") as f:
+            checkpoints = pickle.load(f)
+    except FileNotFoundError:
+        print("Errore: esegui prima create_track.py per generare i checkpoint!")
+        return
+
+    
     spawn_pos = find_spawn(track)
     base_angle = -135
     
@@ -192,7 +218,7 @@ def main():
         population[0].weights = saved_weights
 
     while True:
-        run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle)
+        run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle, checkpoints)
         # Salva il migliore di ogni generazione automaticamente
         save_model(population[0]) 
         population = evolve(population, spawn_pos, base_angle)
