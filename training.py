@@ -10,15 +10,17 @@ import os
 POP_SIZE = 30
 SENSOR_COUNT = 5
 
+TRACK_NAME = "pista_gara"
+
 # LOGICA DI SALVATAGGIO ---
 def save_model(brain):
-    with open("checkpoints.pkl", "wb") as f:
+    with open(f"tracks/{TRACK_NAME}.pkl", "wb") as f:
         pickle.dump(brain.weights, f)
     print(">>> Progresso salvato in checkpoints.pkl")
 
 def load_model():
-    if os.path.exists("checkpoints.pkl"):
-        with open("checkpoints.pkl", "rb") as f:
+    if os.path.exists(f"tracks/{TRACK_NAME}.pkl"):
+        with open(f"tracks/{TRACK_NAME}.pkl", "rb") as f:
             print(">>> Modello precedente caricato con successo!")
             return pickle.load(f)
     return None
@@ -204,7 +206,7 @@ def main():
     
     # 1. Caricamento Immagine
     try:
-        track_temp = pygame.image.load("pista_gara.png")
+        track_temp = pygame.image.load(f"{TRACK_NAME}.png")
         WIDTH, HEIGHT = track_temp.get_size()
         screen = pygame.display.set_mode((WIDTH, HEIGHT))
         track = track_temp.convert()
@@ -214,7 +216,7 @@ def main():
 
     # 2. Caricamento Configurazione (Unico file necessario)
     try:
-        with open("track_config.pkl", "rb") as f:
+        with open(f"tracks_config/{TRACK_NAME}.pkl", "rb") as f:
             config = pickle.load(f)
         
         # Estraiamo tutto dal dizionario

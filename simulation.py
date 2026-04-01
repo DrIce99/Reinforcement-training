@@ -11,6 +11,8 @@ NUM_RACERS = 20  # Numero di partecipanti alla gara
 SENSOR_COUNT = 5
 WIDTH, HEIGHT = 800, 600
 
+TRACK_NAME = "pista_gara"
+
 # --- CLASSE PILOTA GARA ---
 class Racer:
     def __init__(self, weights, color, racer_id, spawn_pos, base_angle):
@@ -130,7 +132,7 @@ def main():
     
     pygame.init()
     # track = pygame.image.load("circuit.png").convert()
-    track_temp = pygame.image.load("pista_gara.png")
+    track_temp = pygame.image.load(f"{TRACK_NAME}.png")
     WIDTH, HEIGHT = track_temp.get_size()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     track = track_temp.convert()
@@ -177,7 +179,7 @@ def main():
         r_id = i + 1
         # Ogni pilota ha il DNA del migliore + una piccola variazione casuale (0.05)
         individual_dna = get_driver_weights(r_id, trained_weights)
-        if not os.path.exists(f"single/driver_{r_id}.pkl"):
+        if not os.path.exists(f"single/{TRACK_NAME}/driver_{r_id}.pkl"):
             individual_dna += np.random.normal(0, 0.05, individual_dna.shape)
         color = BASE_COLORS[i % len(BASE_COLORS)]
         # Griglia di partenza: spostiamo leggermente ogni pilota per non sovrapporli
