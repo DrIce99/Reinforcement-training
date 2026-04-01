@@ -1,52 +1,78 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import splprep, splev
+import pickle
+import pygame
+import math
 
-def genera_e_salva_circuito(filename="circuito_generato.png", n_punti=20):
-    # 1. Generazione punti polari con jitter (garantisce no intersezioni)
-    angoli = np.linspace(0, 2*np.pi, n_punti, endpoint=False)
-    angoli += np.random.uniform(-0.05, 0.05, n_punti) # Leggera asimmetria
-    angoli = np.sort(angoli)
-    
-    raggio_medio = 50
-    # Jitter radiale per creare curve e rientranze complesse
-    raggi = raggio_medio + np.random.uniform(-25, 25, n_punti)
+def genera_e_salva_circuito(filename="pista_gara.png", n_punti=12):
+    # 1. Generazione punti base
+    angoli = np.sort(np.random.uniform(0, 2*np.pi, n_punti))
+    raggi = 50 + np.random.uniform(-20, 20, n_punti)
     
     x = raggi * np.cos(angoli)
     y = raggi * np.sin(angoli)
-    
-    # Chiusura del set di punti
     x = np.append(x, x[0])
     y = np.append(y, y[0])
     
-    # 2. Interpolazione Spline Cubica Periodica
+    # 2. Interpolazione Spline
     tck, u = splprep([x, y], s=0, per=True)
     u_fine = np.linspace(0, 1, 1000)
     smooth_x, smooth_y = splev(u_fine, tck)
     
-    # 3. Checkpoints (15 punti distribuiti sulla spline)
-    n_checkpoints = 15
+    # 3. Creazione figura con dimensioni fisse (800x600)
+    dpi = 100
+    fig = plt.figure(figsize=(8, 6), dpi=dpi, facecolor='black')
+    ax = fig.add_axes([0, 0, 1, 1], frameon=False)
+    ax.set_facecolor('black')
+    
+    # Disegna solo la PISTA BIANCA (niente checkpoint colorati qui!)
+    ax.plot(smooth_x, smooth_y, color='white', linewidth=40, zorder=1)
+    
+    # Calcola le posizioni dei Checkpoint e dello Spawn
+    n_checkpoints = 20
     u_cp = np.linspace(0, 1, n_checkpoints, endpoint=False)
     cp_x, cp_y = splev(u_cp, tck)
     
-    # 4. Rendering e salvataggio PNG
-    fig = plt.figure(figsize=(10, 10), facecolor='black')
-    ax = fig.add_axes([0, 0, 1, 1], frameon=False, aspect='equal')
-    ax.set_facecolor('black')
+    # Trasforma le coordinate di Matplotlib in coordinate Pixel (0-800, 0-600)
+    # Calcoliamo il fattore di scala basandoci sui limiti degli assi
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
     
-    # Disegna tracciato bianco
-    ax.plot(smooth_x, smooth_y, color='white', linewidth=35, zorder=1)
-    
-    # Disegna checkpoints azzurri
-    ax.scatter(cp_x[1:], cp_y[1:], color='cyan', s=60, edgecolors='white', zorder=3)
-    
-    # Disegna spawn point verde (quadrato)
-    ax.scatter(cp_x[0], cp_y[0], color='#00FF00', s=250, marker='s', edgecolors='white', zorder=5)
-    
-    plt.xticks([]); plt.yticks([])
-    plt.savefig(filename, facecolor='black', bbox_inches='tight', pad_inches=0)
-    plt.close(fig)
-    print(f"Circuito salvato con successo in: {filename}")
+    def to_pixel(x_val, y_val):
+        px = ((x_val - x_min) / (x_max - x_min)) * 800
+        py = (1.0 - (y_val - y_min) / (y_max - y_min)) * 600 # Inverti Y per Pygame
+        return (int(px), int(py))
 
-# Generazione
-genera_e_salva_circuito("pista_gara.png")
+    # Salva Checkpoint e Spawn per il Training
+    pixel_checkpoints = [to_pixel(cx, cy) for cx, cy in zip(cp_x, cp_y)]
+    spawn_pixel = pixel_checkpoints[0]
+    
+    # Disegna lo spawn point VERDE (0, 255, 0) puro sull'immagine
+    ax.scatter(cp_x[0], cp_y[0], color='#00FF00', s=100, marker='o', zorder=5)
+
+    # Salvataggio immagine
+    plt.savefig(filename, facecolor='black')
+    plt.close(fig)
+    
+    p1 = pixel_checkpoints[0]
+    p2 = pixel_checkpoints[1]
+    # atan2 restituisce l'angolo in radianti, lo convertiamo in gradi per Pygame
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    base_angle = math.degrees(math.atan2(dy, dx))
+
+    # Salva tutto in un dizionario per comodità
+    track_data = {
+        "checkpoints": pixel_checkpoints,
+        "spawn_pos": pixel_checkpoints[0],
+        "base_angle": base_angle
+    }
+
+    with open("track_config.pkl", "wb") as f:
+        pickle.dump(track_data, f)
+
+    print(f"Configurazione salvata! Angolo di partenza: {base_angle:.2f}°")
+
+if __name__ == "__main__":
+    genera_e_salva_circuito()

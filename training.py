@@ -12,13 +12,13 @@ SENSOR_COUNT = 5
 
 # LOGICA DI SALVATAGGIO ---
 def save_model(brain):
-    with open("best_brain.pkl", "wb") as f:
+    with open("checkpoints.pkl", "wb") as f:
         pickle.dump(brain.weights, f)
-    print(">>> Progresso salvato in best_brain.pkl")
+    print(">>> Progresso salvato in checkpoints.pkl")
 
 def load_model():
-    if os.path.exists("best_brain.pkl"):
-        with open("best_brain.pkl", "rb") as f:
+    if os.path.exists("checkpoints.pkl"):
+        with open("checkpoints.pkl", "rb") as f:
             print(">>> Modello precedente caricato con successo!")
             return pickle.load(f)
     return None
@@ -108,46 +108,47 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
             sensors = get_sensors(brain.pos, brain.angle, track)
             action = brain.predict(sensors)
 
-            # Decisioni: action[0] = sterzo, action[1] = velocità
+            # Decisioni
             steer = action[0] * 5
-            speed = max(1, (action[1] + 1) * 4) # Velocità da 1 a 8
+            speed = max(1, (action[1] + 1) * 4) 
 
             brain.angle += steer
             rad = math.radians(brain.angle)
             old_pos = brain.pos.copy()
             brain.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * speed
             
-            # Punteggio base per il movimento
             brain.score += old_pos.distance_to(brain.pos)
-            # Penale tempo: più tempo passi in pista, meno punti fai
             brain.score -= 0.1 
             
-            target_cp = checkpoints[brain.next_cp]
-            dist_to_cp = brain.pos.distance_to(pygame.Vector2(target_cp))
-            
-            if dist_to_cp < 70: 
-                brain.score += 5000 
-                brain.next_cp += 1 
+            # --- UNICA LOGICA DI ARRIVO: I CHECKPOINT ---
+            if brain.next_cp < len(checkpoints):
+                target_cp = checkpoints[brain.next_cp]
+                dist_to_cp = brain.pos.distance_to(pygame.Vector2(target_cp))
+                
+                if dist_to_cp < 70: 
+                    brain.score += 5000 
+                    brain.next_cp += 1 
 
-                # Se ha superato l'ultimo checkpoint della lista
-                if brain.next_cp >= len(checkpoints):
-                    brain.completed = True
-                    # Calcola bonus velocità basato sul tempo
-                    bonus_velocita = max(1000, 10000 - frame_count * 2)
-                    brain.score += bonus_velocita
-                    print(f"PALLINO ARRIVATO! Gen: {generation} | Tempo: {frame_count}")
-                    return
-
-            # --- LOGICA TRAGUARDO (Classifica) ---
-            dist_to_start = brain.pos.distance_to(spawn_pos)
-            if brain.score > 500 and dist_to_start < 30:
-                finish_count += 1
-                # Il bonus decresce in base al tempo (frame_count)
-                # Più è basso frame_count, più è alto il bonus
-                bonus = max(1000, 10000 - frame_count * 2) 
-                brain.score += bonus
+                    # IL TRAGUARDO
+                    if brain.next_cp >= len(checkpoints):
+                        finish_count += 1
+                        brain.completed = True
+                        
+                        # PREMIO POSIZIONE: Il 1° prende più del 2°, ecc.
+                        # Esempio: 1° = 10.000, 2° = 9.000, 3° = 8.000...
+                        premio_posizione = max(1000, 10000 - (finish_count - 1) * 1000)
+                        
+                        # PREMIO VELOCITÀ: Bonus basato sui frame totali (chi corre forte vince di più)
+                        premio_velocita = max(500, 5000 - frame_count)
+                        
+                        brain.score += (premio_posizione + premio_velocita)
+                        
+                        print(f"PILOTA {population.index(brain)} ARRIVATO! Posizione: {finish_count} | Tempo: {frame_count}")
+                        # Se vuoi che la generazione finisca appena il PRIMO arriva:
+                        
+            else:
+                # Caso di sicurezza: se per qualche motivo l'indice è già fuori, completa
                 brain.completed = True
-                print(f"Pilota {population.index(brain)} ARRIVATO! Posizione: {finish_count}")
 
             # --- COLLISIONE ---
             try:
@@ -201,11 +202,31 @@ def main():
 
     track = pygame.transform.scale(track, (WIDTH, HEIGHT))
     
+    # 1. Caricamento Immagine
     try:
-        with open("checkpoints.pkl", "rb") as f:
-            checkpoints = pickle.load(f)
-    except FileNotFoundError:
-        print("Errore: esegui prima create_track.py per generare i checkpoint!")
+        track_temp = pygame.image.load("pista_gara.png")
+        WIDTH, HEIGHT = track_temp.get_size()
+        screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        track = track_temp.convert()
+    except pygame.error:
+        print("Errore: Immagine pista_gara.png non trovata!")
+        return
+
+    # 2. Caricamento Configurazione (Unico file necessario)
+    try:
+        with open("track_config.pkl", "rb") as f:
+            config = pickle.load(f)
+        
+        # Estraiamo tutto dal dizionario
+        checkpoints = config["checkpoints"]
+        spawn_pos = pygame.Vector2(config["spawn_pos"])
+        base_angle = config["base_angle"]
+        
+        print(f"Track caricato correttamente!")
+        print(f"Checkpoints: {len(checkpoints)} | Start Angle: {base_angle:.1f}°")
+        
+    except (FileNotFoundError, KeyError):
+        print("Errore: Il file track_config.pkl è assente o corrotto. Rigenera la pista!")
         return
 
     
