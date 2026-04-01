@@ -5,7 +5,7 @@ import pickle
 import numpy as np
 
 # --- CONFIGURAZIONE MASSIMA ---
-WIDTH, HEIGHT = 2500, 1800 
+WIDTH, HEIGHT = 1800, 1000 
 TRACK_WIDTH = 80
 COLLISION_THRESHOLD = TRACK_WIDTH * 1.5
 
@@ -141,7 +141,7 @@ def main():
     checkpoints = [gen.points[i] for i in range(0, len(gen.points), 12)]
     pygame.draw.circle(surface, (0, 255, 0), (int(spawn.x), int(spawn.y)), 20)
 
-    with open("track_config.pkl", "wb") as f:
+    with open("tracks_config/pista_gara.pkl", "wb") as f:
         pickle.dump({"checkpoints": checkpoints, "spawn_pos": (spawn.x, spawn.y), "base_angle": angle}, f)
     
     pygame.image.save(surface, "pista_gara.png")
