@@ -94,7 +94,9 @@ class Racer:
                 dist += 4
                 x, y = int(self.pos.x + math.cos(ray_angle) * dist), int(self.pos.y + math.sin(ray_angle) * dist)
                 try:
-                    if track.get_at((x, y)).r < 30: break
+                    pixel = track.get_at((x, y))
+                    if pixel.r < 50 and pixel.g < 50 and pixel.b < 50:
+                        break
                 except: break
             sensors.append(dist / max_dist)
         return np.array(sensors)
@@ -114,8 +116,9 @@ class Racer:
 
 # --- FUNZIONI DI SUPPORTO ---
 def load_best_weights():
-    if os.path.exists("checkpoints.pkl"):
-        with open("checkpoints.pkl", "rb") as f:
+    path = f"tracks/{TRACK_NAME}.pkl"
+    if os.path.exists(path):
+        with open(path, "rb") as f:
             return pickle.load(f)
     return None
 
@@ -140,8 +143,11 @@ def main():
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Arial", 18)
 
-    spawn_pos = find_spawn(track)
-    base_angle = -135 # Regola in base alla direzione del tuo circuito
+    with open(f"tracks_config/{TRACK_NAME}.pkl", "rb") as f:
+        config = pickle.load(f)
+
+    spawn_pos = pygame.Vector2(config["spawn_pos"])
+    base_angle = config["base_angle"]
 
     # Caricamento intelligenza appresa
     trained_weights = load_best_weights()
@@ -212,7 +218,7 @@ def main():
             screen.blit(entry, (WIDTH - 180, 20 + i * 25))
 
         pygame.display.flip()
-        clock.tick(60)
+        clock.tick(120)
 
         active = [r for r in racers if r.alive and not r.completed]
         if not active:

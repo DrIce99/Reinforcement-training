@@ -10,7 +10,7 @@ import os
 POP_SIZE = 30
 SENSOR_COUNT = 5
 
-TRACK_NAME = "pista_gara"
+TRACK_NAME = "pista_gara1"
 
 # LOGICA DI SALVATAGGIO ---
 def save_model(brain):
@@ -38,6 +38,9 @@ class Brain:
             self.weights = np.random.uniform(-1, 1, (SENSOR_COUNT, 2))
         else:
             self.weights = weights
+        
+        self.confidence = 0.0   # quanto è sicuro della direzione
+        self.stuck_timer = 0
 
         self.reset(spawn_pos, base_angle)
 
@@ -46,13 +49,21 @@ class Brain:
         self.angle = base_angle + random.uniform(-10, 10)
         self.alive = True
         self.score = 0
+        self.next_cp = 0
         self.completed = False
 
     def predict(self, sensors):
-        # Il "cervello" moltiplica i sensori per i pesi
-        # Ritorna un array con due valori: [sterzo, velocità]
         output = np.dot(sensors, self.weights)
-        return np.tanh(output) # Normalizza l'output tra -1 e 1
+        output = np.tanh(output)
+
+        steer = output[0]
+        speed = output[1]
+
+        # CONFIDENCE = quanto il cervello “vede chiaro”
+        # (più i sensori sono forti/contrastati → più è sicuro)
+        self.confidence = float(np.mean(sensors) - np.std(sensors))
+
+        return np.array([steer, speed])
 
 # --- SENSORI ---
 def get_sensors(pos, angle, track):
@@ -89,6 +100,7 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
     running = True
     finish_count = 0 # Conta quanti hanno finito il giro
     frame_count = 0  # Timer della simulazione
+    skip_generation = False
 
     for brain in population:
         brain.reset(spawn_pos, base_angle)
@@ -96,6 +108,19 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
     while running:
         frame_count += 1
         for event in pygame.event.get():
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_s:  # premi S per skippare
+                    skip_generation = True
+            
+            if skip_generation:
+                # uccide tutti quelli ancora vivi (non verranno considerati bene nello score)
+                for brain in population:
+                    if brain.alive and not brain.completed:
+                        brain.alive = False
+                        brain.score -= 1000  # penalità forte per evitare che vengano scelti
+
+                running = False
+                        
             if event.type == pygame.QUIT:
                 pygame.quit(); exit()
 
@@ -111,13 +136,39 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
             action = brain.predict(sensors)
 
             # Decisioni
-            steer = action[0] * 5
-            speed = max(1, (action[1] + 1) * 4) 
+            steer_raw = action[0]
+            speed_raw = action[1]
 
+            # --- CONFIDENCE GATE ---
+            # finché non è sicuro, va piano e sterza più forte
+            safe_zone = 0.35  # soglia regolabile
+
+            if brain.confidence < safe_zone:
+                speed = 1.5 + (speed_raw + 1) * 0.5
+                steer = steer_raw * 7
+            else:
+                speed = 2 + (speed_raw + 1) * 5
+                steer = steer_raw * (5 + speed * 0.3)
+
+            # applica sterzo dipendente dalla velocità
             brain.angle += steer
+            
+            brain.angle += (speed * 0.15) * steer_raw
+            
             rad = math.radians(brain.angle)
             old_pos = brain.pos.copy()
             brain.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * speed
+            
+            if old_pos.distance_to(brain.pos) < 0.5:
+                brain.stuck_timer += 1
+            else:
+                brain.stuck_timer = 0
+
+            # punizione se si incastra
+            if brain.stuck_timer > 20:
+                brain.score -= 20
+                brain.angle += random.uniform(-30, 30)
+                brain.stuck_timer = 0
             
             brain.score += old_pos.distance_to(brain.pos)
             brain.score -= 0.1 
@@ -171,7 +222,7 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
         txt = font.render(f"Gen: {generation} | Vivi: {alive_count} | Arrivati: {finish_count}", True, (0,255,0))
         screen.blit(txt, (10, 10))
         pygame.display.flip()
-        clock.tick(120) # Aumentato a 120 per velocizzare l'allenamento visivo
+        clock.tick(240) # Aumentato a 120 per velocizzare l'allenamento visivo
 
 # --- EVOLUZIONE ---
 def evolve(population, spawn_pos, base_angle):
@@ -233,7 +284,7 @@ def main():
 
     
     spawn_pos = find_spawn(track)
-    base_angle = -135
+    base_angle = 90
     
     generation = 0 
     

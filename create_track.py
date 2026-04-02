@@ -3,149 +3,115 @@ import math
 import random
 import pickle
 import numpy as np
+from scipy.interpolate import splprep, splev
+from scipy.spatial import ConvexHull
+import os
 
-# --- CONFIGURAZIONE MASSIMA ---
+# --- CONFIGURAZIONE ---
 WIDTH, HEIGHT = 1800, 1000 
 TRACK_WIDTH = 80
-COLLISION_THRESHOLD = TRACK_WIDTH * 1.5
-
-def point_to_segment_distance(p, a, b):
-    ap = p - a
-    ab = b - a
-    ab_len = ab.length_squared()
-    if ab_len == 0:
-        return ap.length()
-    t = max(0, min(1, ap.dot(ab) / ab_len))
-    closest = a + ab * t
-    return (p - closest).length()
 
 class TrackGenerator:
     def __init__(self):
         self.points = []
-        # Partiamo in un quadrante specifico per iniziare il giro largo
-        self.current_pos = pygame.Vector2(400, 300)
-        self.spawn_pos = self.current_pos.copy()
-        self.current_angle = 0
-        
-        # Waypoints obbligatori per forzare l'uso di tutta la mappa
-        self.waypoints = [
-            pygame.Vector2(WIDTH - 400, 300),    # Angolo Top-Right
-            pygame.Vector2(WIDTH - 400, HEIGHT - 300), # Angolo Bottom-Right
-            pygame.Vector2(400, HEIGHT - 300),   # Angolo Bottom-Left
-            self.spawn_pos                       # Ritorno
-        ]
-
-    def add_rettilineo(self, length):
-        step = 25
-        for _ in range(0, int(length), step):
-            next_p = self.current_pos + pygame.Vector2(math.cos(math.radians(self.current_angle)), 
-                                                       math.sin(math.radians(self.current_angle))) * step
-            
-            # Limiti fisici (margine di sicurezza 100px)
-            if not (100 < next_p.x < WIDTH-100 and 100 < next_p.y < HEIGHT-100): return False
-            
-            # Auto-collisione (escludiamo i punti recenti)
-            if len(self.points) > 10:
-                for i in range(len(self.points) - 10):
-                    a = pygame.Vector2(self.points[i])
-                    b = pygame.Vector2(self.points[i + 1])
-                    if point_to_segment_distance(next_p, a, b) < COLLISION_THRESHOLD:
-                        return False
-                    
-            self.current_pos = next_p
-            self.points.append((self.current_pos.x, self.current_pos.y))
-        return True
-
-    def steer_towards(self, target):
-        """Sterza gradualmente verso un punto target"""
-        vec_to_target = target - self.current_pos
-        target_angle = math.degrees(math.atan2(vec_to_target.y, vec_to_target.x))
-        
-        # Calcola la differenza d'angolo minima
-        diff = (target_angle - self.current_angle + 180) % 360 - 180
-        
-        # Applica una curva morbida o un rettilineo
-        steer_limit = random.randint(15, 45)
-        
-        angle_to_apply = max(-steer_limit, min(steer_limit, diff))
-        
-        # Definisci lo step (5 o -5)
-        angle_step = 5 if angle_to_apply > 0 else -5
-        
-        # Applica l'angolo e aggiungi il tratto
-        self.current_angle += angle_step
-        return self.add_rettilineo(30)
 
     def build_track(self):
-        base_angle = 0
-        self.add_rettilineo(400) # Rettilineo Box
+        margin = 150
+        num_initial_points = 18 # Aumentato leggermente per varietà
         
-        # Per ogni waypoint obbligatorio, navighiamo aggiungendo tratti casuali
-        for wp in self.waypoints:
-            dist_to_wp = self.current_pos.distance_to(wp)
-            attempts = 0
-            max_attempts = 500
-
-            while dist_to_wp > 300 and attempts < max_attempts:
-                attempts += 1
-                # 70% delle volte punta al waypoint, 30% fa una manovra casuale
-                if random.random() < 0.7:
-                    self.steer_towards(wp)
-                else:
-                    move_type = random.choice(["chicane", "curva", "rettilineo"])
-
-                    if move_type == "chicane":
-                        orig = self.current_angle
-                        self.current_angle += random.choice([30, -30])
-                        if self.add_rettilineo(80):
-                            self.current_angle -= random.choice([30, -30])
-                            self.add_rettilineo(80)
-                        else:
-                            self.current_angle = orig
-
-                    elif move_type == "curva":
-                        self.current_angle += random.randint(-20, 20)
-                        self.add_rettilineo(random.randint(60, 140))
-
-                    else:  # rettilineo
-                        self.add_rettilineo(random.randint(100, 250))
-                        
-                dist_to_wp = self.current_pos.distance_to(wp)
-                if len(self.points) > 5000: break # Sicurezza
-
-        if attempts >= max_attempts:
-            print("⚠️ Bloccato, forzo direzione verso waypoint")
-            direction = (wp - self.current_pos).normalize()
-            self.current_angle = math.degrees(math.atan2(direction.y, direction.x))
-            self.add_rettilineo(200)
+        # 1. Genera punti casuali nell'area
+        random_points = [
+            [random.randint(margin, WIDTH - margin), random.randint(margin, HEIGHT - margin)]
+            for _ in range(num_initial_points)
+        ]
         
-        # Chiusura finale
-        self.points.append((self.spawn_pos.x, self.spawn_pos.y))
-        return self.spawn_pos, base_angle, len(self.points) // 100
+        # 2. Crea l'anello base usando il Convex Hull (evita incroci)
+        hull = ConvexHull(random_points)
+        base_ring = [pygame.Vector2(random_points[i][0], random_points[i][1]) for i in hull.vertices]
+        
+        # 3. Trasforma rettilinei in curve (Distorsione Singola)
+        distorted_points = []
+        for i in range(len(base_ring)):
+            p1 = base_ring[i]
+            p2 = base_ring[(i + 1) % len(base_ring)]
+            
+            distorted_points.append((p1.x, p1.y))
+            
+            # Se il segmento è lungo, aggiungi un "gomito"
+            if p1.distance_to(p2) > 80:
+                mid = (p1 + p2) / 2
+                direction = (p2 - p1).normalize()
+                normal = pygame.Vector2(-direction.y, direction.x)
+                
+                # Spostamento casuale (interno o esterno)
+                offset = random.uniform(-120, 120)
+                curve_point = mid + normal * offset
+                distorted_points.append((curve_point.x, curve_point.y))
+
+        # 4. Smoothing Finale con Spline
+        self.points = self.apply_smoothing(distorted_points)
+        
+        # Calcolo angolo di spawn (direzione tra primo e secondo punto)
+        p1 = pygame.Vector2(self.points[0])
+        p2 = pygame.Vector2(self.points[1])
+        angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
+        
+        return self.points, angle, len(self.points)
+
+    def apply_smoothing(self, points):
+        pts = np.array(points)
+        # s=80-120 offre un ottimo bilanciamento tra fedeltà e morbidezza
+        tck, u = splprep([pts[:,0], pts[:,1]], s=100, per=True)
+        u_new = np.linspace(0, 1, 1500)
+        new_x, new_y = splev(u_new, tck)
+        return list(zip(new_x, new_y))
 
 def main():
     pygame.init()
     gen = TrackGenerator()
-    spawn, angle, complessita = gen.build_track()
+    punti_smooth, angle, _ = gen.build_track()
+    
+    # Primo punto per lo spawn
+    spawn_pos = punti_smooth[0]
     
     surface = pygame.Surface((WIDTH, HEIGHT))
-    surface.fill((0, 0, 0))
+    surface.fill((0, 0, 0)) # Verde scuro erba
 
-    # Disegno Alta Risoluzione
-    for i in range(len(gen.points)-1):
-        p1, p2 = gen.points[i], gen.points[i+1]
-        pygame.draw.line(surface, (255, 255, 255), p1, p2, TRACK_WIDTH)
-        pygame.draw.circle(surface, (255, 255, 255), (int(p1[0]), int(p1[1])), TRACK_WIDTH // 2)
+    # 1. Disegno Pista (Asfalto e Bordi)
+    for i in range(len(punti_smooth)):
+        p1 = (int(punti_smooth[i][0]), int(punti_smooth[i][1]))
+        p2 = (int(punti_smooth[(i+1)%len(punti_smooth)][0]), int(punti_smooth[(i+1)%len(punti_smooth)][1]))
+        
+        pygame.draw.circle(surface, (255, 255, 255), p1, TRACK_WIDTH // 2)
 
-    # Checkpoints densi
-    checkpoints = [gen.points[i] for i in range(0, len(gen.points), 12)]
-    pygame.draw.circle(surface, (0, 255, 0), (int(spawn.x), int(spawn.y)), 20)
+    # 2. Linea di Partenza (Traguardo)
+    p1_start = pygame.Vector2(punti_smooth[0])
+    p2_start = pygame.Vector2(punti_smooth[1])
+    direction = (p2_start - p1_start).normalize()
+    normal = pygame.Vector2(-direction.y, direction.x)
+    line_start = p1_start + normal * (TRACK_WIDTH // 2)
+    line_end = p1_start - normal * (TRACK_WIDTH // 2)
+    pygame.draw.line(surface, (255, 255, 255), line_start, line_end, 10)
 
-    with open("tracks_config/pista_gara.pkl", "wb") as f:
-        pickle.dump({"checkpoints": checkpoints, "spawn_pos": (spawn.x, spawn.y), "base_angle": angle}, f)
+    # 3. Pallino VERDE dello SPAWN
+    spawn_coords = (int(spawn_pos[0]), int(spawn_pos[1]))
+    pygame.draw.circle(surface, (0, 255, 0), spawn_coords, 15)
+
+    # 4. Salvataggio Dati e Immagine
+    if not os.path.exists("tracks_config"): os.makedirs("tracks_config")
     
-    pygame.image.save(surface, "pista_gara.png")
-    print(f"CIRCUITO TOTAL-MAP GENERATO: {WIDTH}x{HEIGHT}")
+    # Checkpoints campionati ogni 30 punti per il sistema di gara
+    checkpoints = [punti_smooth[i] for i in range(0, len(punti_smooth), 30)]
+    
+    with open("tracks_config/pista_gara1.pkl", "wb") as f:
+        pickle.dump({
+            "checkpoints": checkpoints, 
+            "spawn_pos": spawn_pos, 
+            "base_angle": angle
+        }, f)
+    
+    pygame.image.save(surface, "pista_gara1.png")
+    print(f"Circuito generato correttamente. Spawn pos: {spawn_coords}")
     pygame.quit()
 
 if __name__ == "__main__":
