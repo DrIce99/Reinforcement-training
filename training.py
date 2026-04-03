@@ -10,7 +10,7 @@ import os
 POP_SIZE = 30
 SENSOR_COUNT = 5
 
-TRACK_NAME = "pista_gara1"
+TRACK_NAME = "pista_gara"
 
 # LOGICA DI SALVATAGGIO ---
 def save_model(brain):
@@ -284,7 +284,7 @@ def main():
 
     
     spawn_pos = find_spawn(track)
-    base_angle = 90
+    base_angle = -90
     
     generation = 0 
     

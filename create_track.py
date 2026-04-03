@@ -1,118 +1,142 @@
 import pygame
 import math
-import random
 import pickle
 import numpy as np
-from scipy.interpolate import splprep, splev
-from scipy.spatial import ConvexHull
 import os
 
 # --- CONFIGURAZIONE ---
-WIDTH, HEIGHT = 1800, 1000 
-TRACK_WIDTH = 80
+WIDTH, HEIGHT = 1600, 900
+TRACK_WIDTH = 75
+WHITE, GRAY, BLACK, RED, GREEN, BLUE = (255,255,255), (55,55,55), (0,0,0), (255,50,50), (50,255,50), (50,100,255)
 
-class TrackGenerator:
+class ControlPoint:
+    def __init__(self, x, y):
+        self.pos = pygame.Vector2(x, y)
+        self.h_in = pygame.Vector2(x - 60, y)
+        self.h_out = pygame.Vector2(x + 60, y)
+        self.dragging = None 
+        self.locked_handles = False 
+
+class Editor:
     def __init__(self):
         self.points = []
+        self.closed = False
+        self.spawn_pos = pygame.Vector2(WIDTH//2, HEIGHT//2)
+        self.spawn_angle = 0
+        self.setting_spawn = False
 
-    def build_track(self):
-        margin = 150
-        num_initial_points = 18 # Aumentato leggermente per varietà
+    def get_bezier_points(self, steps=30):
+        if len(self.points) < 2: return []
+        res = []
+        pts = list(self.points)
+        if self.closed: pts.append(self.points[0])
         
-        # 1. Genera punti casuali nell'area
-        random_points = [
-            [random.randint(margin, WIDTH - margin), random.randint(margin, HEIGHT - margin)]
-            for _ in range(num_initial_points)
-        ]
+        for i in range(len(pts) - 1):
+            p1, p2 = pts[i], pts[i+1]
+            for t in np.linspace(0, 1, steps):
+                t = float(t)
+                p0, p1_c, p2_c, p3 = p1.pos, p1.h_out, p2.h_in, p2.pos
+                x = (1-t)**3*p0.x + 3*(1-t)**2*t*p1_c.x + 3*(1-t)*t**2*p2_c.x + t**3*p3.x
+                y = (1-t)**3*p0.y + 3*(1-t)**2*t*p1_c.y + 3*(1-t)*t**2*p2_c.y + t**3*p3.y
+                res.append((x, y))
+        return res
+
+    def run(self):
+        pygame.init()
+        screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        pygame.display.set_caption("Track Editor Pro")
+        clock = pygame.time.Clock()
+        font = pygame.font.SysFont("Arial", 16, bold=True)
+
+        while True:
+            m_pos = pygame.Vector2(pygame.mouse.get_pos())
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: return
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    for p in self.points:
+                        if m_pos.distance_to(p.pos) < 15: p.dragging = "pos"; break
+                        if m_pos.distance_to(p.h_in) < 10: p.dragging = "in"; break
+                        if m_pos.distance_to(p.h_out) < 10: p.dragging = "out"; break
+                    else:
+                        if not self.setting_spawn: self.points.append(ControlPoint(m_pos.x, m_pos.y))
+                if event.type == pygame.MOUSEBUTTONUP:
+                    for p in self.points: p.dragging = None
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_c: self.closed = not self.closed
+                    if event.key == pygame.K_l:
+                        for p in self.points: p.locked_handles = not p.locked_handles
+                    if event.key == pygame.K_s: self.setting_spawn = True
+                    if event.key == pygame.K_z and self.points: self.points.pop()
+                    if event.key == pygame.K_RETURN: self.save_all()
+
+            for p in self.points:
+                if p.dragging == "pos":
+                    d = m_pos - p.pos
+                    p.pos += d; p.h_in += d; p.h_out += d
+                elif p.dragging == "in":
+                    p.h_in = pygame.Vector2(m_pos)
+                    if p.locked_handles: p.h_out = p.pos + (p.pos - p.h_in)
+                elif p.dragging == "out":
+                    p.h_out = pygame.Vector2(m_pos)
+                    if p.locked_handles: p.h_in = p.pos + (p.pos - p.h_out)
+
+            if self.setting_spawn:
+                if pygame.mouse.get_pressed()[0]: self.spawn_pos = pygame.Vector2(m_pos)
+                diff = m_pos - self.spawn_pos
+                if diff.length() > 5: self.spawn_angle = math.degrees(math.atan2(-diff.y, diff.x))
+                if event.type == pygame.MOUSEBUTTONUP: self.setting_spawn = False
+
+            screen.fill((0, 0, 0))
+            bezier_pts = self.get_bezier_points(steps=30)
+
+            if len(bezier_pts) > 1:
+                # pygame.draw.lines(screen, (200, 200, 200), False, bezier_pts, TRACK_WIDTH + 10)
+                pygame.draw.lines(screen, WHITE, False, bezier_pts, TRACK_WIDTH)
+
+            for p in self.points:
+                pygame.draw.line(screen, (255,255,255), p.h_in, p.h_out, 1)
+                pygame.draw.circle(screen, WHITE, (int(p.pos.x), int(p.pos.y)), 12)
+                pygame.draw.circle(screen, RED, (int(p.h_in.x), int(p.h_in.y)), 8)
+                pygame.draw.circle(screen, BLUE, (int(p.h_out.x), int(p.h_out.y)), 8)
+
+            rad = math.radians(-self.spawn_angle)
+            end = self.spawn_pos + pygame.Vector2(math.cos(rad), math.sin(rad)) * 60
+            pygame.draw.line(screen, GREEN, self.spawn_pos, end, 6)
+            pygame.draw.circle(screen, GREEN, (int(self.spawn_pos.x), int(self.spawn_pos.y)), 15)
+
+            pygame.display.flip()
+            clock.tick(60)
+
+    def save_all(self):
+        if not os.path.exists("tracks_config"): os.makedirs("tracks_config")
+        pts = self.get_bezier_points(steps=80)
         
-        # 2. Crea l'anello base usando il Convex Hull (evita incroci)
-        hull = ConvexHull(random_points)
-        base_ring = [pygame.Vector2(random_points[i][0], random_points[i][1]) for i in hull.vertices]
+        surf = pygame.Surface((WIDTH, HEIGHT))
+        surf.fill((0, 0, 0))
         
-        # 3. Trasforma rettilinei in curve (Distorsione Singola)
-        distorted_points = []
-        for i in range(len(base_ring)):
-            p1 = base_ring[i]
-            p2 = base_ring[(i + 1) % len(base_ring)]
-            
-            distorted_points.append((p1.x, p1.y))
-            
-            # Se il segmento è lungo, aggiungi un "gomito"
-            if p1.distance_to(p2) > 80:
-                mid = (p1 + p2) / 2
-                direction = (p2 - p1).normalize()
-                normal = pygame.Vector2(-direction.y, direction.x)
-                
-                # Spostamento casuale (interno o esterno)
-                offset = random.uniform(-120, 120)
-                curve_point = mid + normal * offset
-                distorted_points.append((curve_point.x, curve_point.y))
+        if len(pts) > 1:
+            for p in pts: pygame.draw.circle(surf, (255, 255, 255), (int(p[0]), int(p[1])), TRACK_WIDTH // 2)
+            # Traguardo Bianco
+            self.draw_finish_line(surf, self.spawn_pos, self.spawn_angle, color=(0, 255, 0), width=12)
 
-        # 4. Smoothing Finale con Spline
-        self.points = self.apply_smoothing(distorted_points)
-        
-        # Calcolo angolo di spawn (direzione tra primo e secondo punto)
-        p1 = pygame.Vector2(self.points[0])
-        p2 = pygame.Vector2(self.points[1])
-        angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
-        
-        return self.points, angle, len(self.points)
+        pygame.image.save(surf, "pista_gara.png")
+        with open("tracks_config/pista_gara.pkl", "wb") as f:
+            pickle.dump({
+                "checkpoints": pts[::20], 
+                "spawn_pos": (self.spawn_pos.x, self.spawn_pos.y), 
+                "base_angle": self.spawn_angle
+            }, f)
+        print("Salvataggio completato: Immagine con traguardo linea creata.")
 
-    def apply_smoothing(self, points):
-        pts = np.array(points)
-        # s=80-120 offre un ottimo bilanciamento tra fedeltà e morbidezza
-        tck, u = splprep([pts[:,0], pts[:,1]], s=100, per=True)
-        u_new = np.linspace(0, 1, 1500)
-        new_x, new_y = splev(u_new, tck)
-        return list(zip(new_x, new_y))
-
-def main():
-    pygame.init()
-    gen = TrackGenerator()
-    punti_smooth, angle, _ = gen.build_track()
-    
-    # Primo punto per lo spawn
-    spawn_pos = punti_smooth[0]
-    
-    surface = pygame.Surface((WIDTH, HEIGHT))
-    surface.fill((0, 0, 0)) # Verde scuro erba
-
-    # 1. Disegno Pista (Asfalto e Bordi)
-    for i in range(len(punti_smooth)):
-        p1 = (int(punti_smooth[i][0]), int(punti_smooth[i][1]))
-        p2 = (int(punti_smooth[(i+1)%len(punti_smooth)][0]), int(punti_smooth[(i+1)%len(punti_smooth)][1]))
-        
-        pygame.draw.circle(surface, (255, 255, 255), p1, TRACK_WIDTH // 2)
-
-    # 2. Linea di Partenza (Traguardo)
-    p1_start = pygame.Vector2(punti_smooth[0])
-    p2_start = pygame.Vector2(punti_smooth[1])
-    direction = (p2_start - p1_start).normalize()
-    normal = pygame.Vector2(-direction.y, direction.x)
-    line_start = p1_start + normal * (TRACK_WIDTH // 2)
-    line_end = p1_start - normal * (TRACK_WIDTH // 2)
-    pygame.draw.line(surface, (255, 255, 255), line_start, line_end, 10)
-
-    # 3. Pallino VERDE dello SPAWN
-    spawn_coords = (int(spawn_pos[0]), int(spawn_pos[1]))
-    pygame.draw.circle(surface, (0, 255, 0), spawn_coords, 15)
-
-    # 4. Salvataggio Dati e Immagine
-    if not os.path.exists("tracks_config"): os.makedirs("tracks_config")
-    
-    # Checkpoints campionati ogni 30 punti per il sistema di gara
-    checkpoints = [punti_smooth[i] for i in range(0, len(punti_smooth), 30)]
-    
-    with open("tracks_config/pista_gara1.pkl", "wb") as f:
-        pickle.dump({
-            "checkpoints": checkpoints, 
-            "spawn_pos": spawn_pos, 
-            "base_angle": angle
-        }, f)
-    
-    pygame.image.save(surface, "pista_gara1.png")
-    print(f"Circuito generato correttamente. Spawn pos: {spawn_coords}")
-    pygame.quit()
+    def draw_finish_line(self, surface, pos, angle, color=(0, 255, 0), width=10):
+        """Disegna la linea di traguardo perpendicolare alla direzione"""
+        rad = math.radians(-angle)
+        direction = pygame.Vector2(math.cos(rad), math.sin(rad))
+        normal = pygame.Vector2(-direction.y, direction.x)
+        l_start = pos + normal * (TRACK_WIDTH // 2)
+        l_end = pos - normal * (TRACK_WIDTH // 2)
+        pygame.draw.line(surface, color, l_start, l_end, width)
+        return l_start, l_end # Utile per calcolare hitbox se necessario
 
 if __name__ == "__main__":
-    main()
+    Editor().run()
