@@ -7,7 +7,7 @@ import os
 
 # --- CONFIG ---
 # WIDTH, HEIGHT = 800, 600
-POP_SIZE = 30
+POP_SIZE = 60
 SENSOR_COUNT = 5
 
 TRACK_NAME = "pista_gara"
@@ -51,6 +51,7 @@ class Brain:
         self.score = 0
         self.next_cp = 0
         self.completed = False
+        self.velocity = 0
 
     def predict(self, sensors):
         output = np.dot(sensors, self.weights)
@@ -140,24 +141,54 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
             speed_raw = action[1]
 
             # --- CONFIDENCE GATE ---
-            # finché non è sicuro, va piano e sterza più forte
-            safe_zone = 0.35  # soglia regolabile
+            safe_zone = 0.35
 
             if brain.confidence < safe_zone:
-                speed = 1.5 + (speed_raw + 1) * 0.5
+                base_speed = 1.5 + (speed_raw + 1) * 0.5
                 steer = steer_raw * 7
             else:
-                speed = 2 + (speed_raw + 1) * 5
-                steer = steer_raw * (5 + speed * 0.3)
+                base_speed = 2 + (speed_raw + 1) * 5
+                steer = steer_raw * (5 + base_speed * 0.3)
+
+            # --- NUOVA LOGICA VELOCITÀ DINAMICA ---
+
+            # quanto sta sterzando (0 = dritto, 1 = curva forte)
+            turn_intensity = abs(steer_raw)
+
+            # perdita velocità in curva
+            turn_penalty = 1.0 - (turn_intensity * 0.7)
+
+            # bonus se va dritto
+            straight_bonus = 1.0 + ((1.0 - turn_intensity) * 0.5)
+            
+            # velocità finale
+            speed = base_speed * turn_penalty * straight_bonus
+
+            speed = speed * (1.0 - (speed / 10.0) * 0.5)
+            
+            curve_penalty = 1.0 - (abs(steer_raw) * 0.8)
+            speed *= curve_penalty
+            
+            # clamp per evitare valori strani
+            speed = max(0.5, min(speed, 8))
 
             # applica sterzo dipendente dalla velocità
-            brain.angle += steer
-            
-            brain.angle += (speed * 0.15) * steer_raw
+            grip = max(0.2, 1.0 - speed * 1.1)
+
+            brain.angle += steer * grip
             
             rad = math.radians(brain.angle)
             old_pos = brain.pos.copy()
-            brain.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * speed
+            # inerzia: la velocità cambia gradualmente
+            acceleration = 0.01   # prima era tipo 0.2 → enorme differenza
+            brake_force = 0.08    # frena più velocemente di quanto accelera
+
+            if speed > brain.velocity:
+                brain.velocity += (speed - brain.velocity) * acceleration
+            else:
+                brain.velocity += (speed - brain.velocity) * brake_force
+
+            brain.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * brain.velocity
             
             if old_pos.distance_to(brain.pos) < 0.5:
                 brain.stuck_timer += 1
@@ -170,8 +201,10 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
                 brain.angle += random.uniform(-30, 30)
                 brain.stuck_timer = 0
             
-            brain.score += old_pos.distance_to(brain.pos)
-            brain.score -= 0.1 
+            brain.score += old_pos.distance_to(brain.pos) * 0.5
+            brain.score += (1.0 - abs(steer_raw)) * 0.1
+            # penalizza andare troppo veloce (spinge a usare velocità controllata)
+            brain.score -= brain.velocity * 0.01
             
             # --- UNICA LOGICA DI ARRIVO: I CHECKPOINT ---
             if brain.next_cp < len(checkpoints):
@@ -179,7 +212,7 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
                 dist_to_cp = brain.pos.distance_to(pygame.Vector2(target_cp))
                 
                 if dist_to_cp < 70: 
-                    brain.score += 5000 
+                    brain.score += 8000 
                     brain.next_cp += 1 
 
                     # IL TRAGUARDO
@@ -207,7 +240,12 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
             try:
                 if track.get_at((int(brain.pos.x), int(brain.pos.y))).r < 30:
                     brain.alive = False
-                    brain.score -= 50 # Penalità pesante per chi sbatte
+                    
+                    # penalità base
+                    brain.score -= 50
+                    
+                    # penalità proporzionale alla velocità (chi muore veloce viene punito tantissimo)
+                    brain.score -= brain.velocity * 20
             except:
                 brain.alive = False
 
@@ -236,7 +274,8 @@ def evolve(population, spawn_pos, base_angle):
     while len(new_pop) < POP_SIZE:
         parent = random.choice(elite)
         # Passa spawn_pos e base_angle, poi i nuovi pesi
-        new_weights = parent.weights + np.random.normal(0, 0.1, parent.weights.shape)
+        mutation_strength = random.uniform(0.05, 0.3)
+        new_weights = parent.weights + np.random.normal(0, mutation_strength, parent.weights.shape)
         new_pop.append(Brain(spawn_pos, base_angle, weights=new_weights))
 
     return new_pop

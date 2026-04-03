@@ -32,6 +32,9 @@ class Racer:
         
         self.learning_rate = 0.01  # Quanto velocemente cambia idea
         self.prev_dist_to_walls = 0
+        
+        self.velocity = 0
+        self.prev_steer = 0
 
     def predict(self, sensors):
         output = np.dot(sensors, self.weights)
@@ -49,13 +52,58 @@ class Racer:
         action = self.predict(sensors)
 
         # Movimento
-        steer = action[0] * 5
-        speed = max(2, (action[1] + 1) * 4)
-        
-        self.angle += steer
+        # --- CONTROLLO ---
+        steer_raw = action[0]
+        speed_raw = action[1]
+
+        # sterzo base
+        steer = steer_raw * 5
+
+        # velocità base (come training)
+        base_speed = 2 + (speed_raw + 1) * 5
+
+        # --- PENALITÀ CURVA ---
+        turn_intensity = abs(steer_raw)
+        curve_penalty = 1.0 - (turn_intensity * 0.8)
+
+        # bonus rettilineo
+        straight_bonus = 1.0 + ((1.0 - turn_intensity) * 0.5)
+
+        speed = base_speed * curve_penalty * straight_bonus
+
+        # soft cap velocità
+        speed = speed * (1.0 - (speed / 10.0) * 0.5)
+        speed = max(0.5, min(speed, 8))
+
+        # --- GRIP (meno sterzo ad alta velocità) ---
+        grip = max(0.2, 1.0 - self.velocity * 0.08)
+        self.angle += steer * grip
+
+        # --- INERZIA ---
+        acceleration = 0.03
+        brake_force = 0.08
+
+        if speed > self.velocity:
+            self.velocity += (speed - self.velocity) * acceleration
+        else:
+            self.velocity += (speed - self.velocity) * brake_force
+
+        # movimento reale
         rad = math.radians(self.angle)
-        self.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * speed
-        self.score += speed
+        old_pos = self.pos.copy()
+        self.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * self.velocity
+
+        # --- SCORE MOVIMENTO ---
+        self.score += old_pos.distance_to(self.pos) * 0.5
+
+        # penalità zig-zag
+        steer_change = abs(steer_raw - self.prev_steer)
+        self.score -= steer_change * 2.0
+
+        # penalità sterzate continue
+        self.score -= abs(steer_raw) * 0.2
+
+        self.prev_steer = steer_raw
         
         dist_to_spawn = self.pos.distance_to(spawn_pos)
         
@@ -77,6 +125,10 @@ class Racer:
             pixel = track_image.get_at((int(self.pos.x), int(self.pos.y)))
             if pixel.r < 30 and pixel.g < 30 and pixel.b < 30:
                 self.alive = False
+                
+                # penalità forte se si schianta veloce
+                self.score -= 50
+                self.score -= self.velocity * 200
         except IndexError:
             self.alive = False
 
@@ -148,6 +200,8 @@ def main():
 
     spawn_pos = pygame.Vector2(config["spawn_pos"])
     base_angle = config["base_angle"]
+    
+    base_angle = -90
 
     # Caricamento intelligenza appresa
     trained_weights = load_best_weights()
