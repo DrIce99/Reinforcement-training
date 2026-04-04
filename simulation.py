@@ -36,11 +36,18 @@ class Racer:
         self.velocity = 0
         self.prev_steer = 0
 
+        # Personalità del pilota
+        self.aggressiveness = random.uniform(0.9, 1.15)   # quanto spinge
+        self.precision = random.uniform(0.85, 1.1)        # quanto è pulito nello sterzo
+        self.risk_taking = random.uniform(0.9, 1.2)       # quanto rischia in curva
+
+        self.weights += np.random.normal(0, 0.02, self.weights.shape)
+
     def predict(self, sensors):
         output = np.dot(sensors, self.weights)
         return np.tanh(output)
 
-    def update(self, track_image, spawn_pos, total_laps):
+    def update(self, track_image, spawn_pos, total_laps, racers):
         if not self.alive or self.completed:
             return
 
@@ -57,19 +64,50 @@ class Racer:
         speed_raw = action[1]
 
         # sterzo base
-        steer = steer_raw * 5
+        steer = steer_raw * 5 * self.precision
 
         # velocità base (come training)
-        base_speed = 2 + (speed_raw + 1) * 5
+        base_speed = (2 + (speed_raw + 1) * 5) * self.aggressiveness
+
+                # --- AGGRESSIVITÀ DINAMICA (inseguimento) ---
+        boost = 1.0
+
+        for other in racers:
+            if other is self or not other.alive:
+                continue
+            
+            dist = self.pos.distance_to(other.pos)
+            
+            if dist < 120:
+                # verifica se è davanti
+                rad = math.radians(self.angle)
+                forward = pygame.Vector2(math.cos(rad), math.sin(rad))
+                direction_vec = other.pos - self.pos
+
+                # evita vettore nullo
+                if direction_vec.length_squared() > 0.0001:
+                    direction = direction_vec.normalize()
+                else:
+                    continue
+                
+                dot = forward.dot(direction)
+                
+                if dot > 0.5:  # è davanti
+                    boost += 0.15 * (1 - dist / 120)
+
 
         # --- PENALITÀ CURVA ---
         turn_intensity = abs(steer_raw)
-        curve_penalty = 1.0 - (turn_intensity * 0.8)
+        curve_penalty = 1.0 - (turn_intensity * 0.8 * self.risk_taking)
+        curve_penalty *= (1.0 - (boost - 1.0) * 0.3)
 
         # bonus rettilineo
         straight_bonus = 1.0 + ((1.0 - turn_intensity) * 0.5)
 
         speed = base_speed * curve_penalty * straight_bonus
+        
+        # applica boost ma senza esagerare
+        speed *= min(boost, 1.25)
 
         # soft cap velocità
         speed = speed * (1.0 - (speed / 10.0) * 0.5)
@@ -183,7 +221,7 @@ def find_spawn(track):
 
 # --- MAIN GARA ---
 def main():
-    LAPS_TO_WIN = 3
+    LAPS_TO_WIN = 7
     
     pygame.init()
     # track = pygame.image.load("circuit.png").convert()
@@ -256,7 +294,7 @@ def main():
         # Aggiornamento e Disegno
         active_racers = [r for r in racers if r.alive and not r.completed]
         for r in racers:
-            r.update(track, spawn_pos, LAPS_TO_WIN)
+            r.update(track, spawn_pos, LAPS_TO_WIN, racers)
             color = r.color if r.alive else (50, 50, 50)
             pygame.draw.circle(screen, color, (int(r.pos.x), int(r.pos.y)), 6)
             
