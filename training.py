@@ -331,7 +331,10 @@ def main():
 
     population = [Brain(spawn_pos, base_angle) for _ in range(POP_SIZE)]
     if saved_weights is not None:
-        population[0].weights = saved_weights
+        population = [
+            Brain(spawn_pos, base_angle, weights=saved_weights + np.random.normal(0, 0.05, saved_weights.shape))
+            for _ in range(POP_SIZE)
+        ]
 
     while True:
         run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle, checkpoints)
