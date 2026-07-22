@@ -5,6 +5,8 @@ import random
 import pickle
 import os
 
+from physics import compute_step, check_line_intersection
+
 # --- CONFIG ---
 # WIDTH, HEIGHT = 800, 600
 POP_SIZE = 60
@@ -27,21 +29,34 @@ def load_model():
 
 # --- BRAIN ---
 class Brain:
-    def __init__(self, spawn_pos, base_angle, weights=None):
+    def __init__(self, spawn_pos, base_angle, weights=None, sector_weights=None):
         self.spawn_pos = spawn_pos
-        self.base_angle = base_angle
-        
+        self.base_angle = -90
         self.next_cp = 0
         
-        # Inizializza i pesi: 5 sensori in ingresso, 2 decisioni in uscita (sterzo, velocità)
+        # Inizializza i pesi neurali: 5 sensori in ingresso, 2 decisioni in uscita
         if weights is None:
             self.weights = np.random.uniform(-1, 1, (SENSOR_COUNT, 2))
         else:
             self.weights = weights
+            
+        # --- INIZIO MODIFICA PUNTO 2 ---
+        # Pesi dei settori (uno per checkpoint)
+        # Se non forniti, usa un array di 1 (peso uniforme)
+        if sector_weights is None:
+            # Nota: qui usiamo SENSOR_COUNT come fallback solo se non abbiamo info sui checkpoint,
+            # ma idealmente dovrebbe essere len(checkpoints). 
+            # Per sicurezza, lo inizializziamo a 1.0 e verrà sovrascritto in main()
+            self.sector_weights = np.ones(10) # Metti un numero ragionevole o passalo sempre
+        else:
+            self.sector_weights = sector_weights.copy()
         
+        # Per tracciare quanti piloti attraversano ogni settore (utile per adattivo)
+        self.cp_crossed_flags = np.zeros(len(self.sector_weights))
+        # --- FINE MODIFICA PUNTO 2 ---
+
         self.confidence = 0.0   # quanto è sicuro della direzione
         self.stuck_timer = 0
-
         self.reset(spawn_pos, base_angle)
 
     def reset(self, spawn_pos, base_angle):
@@ -52,18 +67,16 @@ class Brain:
         self.next_cp = 0
         self.completed = False
         self.velocity = 0
+        # Resetta anche i flag dei checkpoint quando si resetta il cervello
+        self.cp_crossed_flags[:] = 0 
 
     def predict(self, sensors):
         output = np.dot(sensors, self.weights)
         output = np.tanh(output)
-
         steer = output[0]
         speed = output[1]
-
         # CONFIDENCE = quanto il cervello “vede chiaro”
-        # (più i sensori sono forti/contrastati → più è sicuro)
         self.confidence = float(np.mean(sensors) - np.std(sensors))
-
         return np.array([steer, speed])
 
 # --- SENSORI ---
@@ -136,101 +149,61 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
             sensors = get_sensors(brain.pos, brain.angle, track)
             action = brain.predict(sensors)
 
-            # Decisioni
-            steer_raw = action[0]
-            speed_raw = action[1]
-
-            # --- CONFIDENCE GATE ---
-            safe_zone = 0.35
-
-            if brain.confidence < safe_zone:
-                base_speed = 1.5 + (speed_raw + 1) * 0.5
-                steer = steer_raw * 7
-            else:
-                base_speed = 2 + (speed_raw + 1) * 5
-                steer = steer_raw * (5 + base_speed * 0.3)
-
-            # --- NUOVA LOGICA VELOCITÀ DINAMICA ---
-
-            # quanto sta sterzando (0 = dritto, 1 = curva forte)
-            turn_intensity = abs(steer_raw)
-
-            # perdita velocità in curva
-            turn_penalty = 1.0 - (turn_intensity * 0.7)
-
-            # bonus se va dritto
-            straight_bonus = 1.0 + ((1.0 - turn_intensity) * 0.5)
-            
-            # velocità finale
-            speed = base_speed * turn_penalty * straight_bonus
-
-            speed = speed * (1.0 - (speed / 10.0) * 0.5)
-            
-            curve_penalty = 1.0 - (abs(steer_raw) * 0.8)
-            speed *= curve_penalty
-            
-            # clamp per evitare valori strani
-            speed = max(0.5, min(speed, 8))
-
-            # applica sterzo dipendente dalla velocità
-            grip = max(0.2, 1.0 - speed * 1.1)
-
-            brain.angle += steer * grip
-            
-            rad = math.radians(brain.angle)
+            steer_raw, speed_raw = action[0], action[1]
             old_pos = brain.pos.copy()
-            # inerzia: la velocità cambia gradualmente
-            acceleration = 0.01   # prima era tipo 0.2 → enorme differenza
-            brake_force = 0.08    # frena più velocemente di quanto accelera
 
-            if speed > brain.velocity:
-                brain.velocity += (speed - brain.velocity) * acceleration
-            else:
-                brain.velocity += (speed - brain.velocity) * brake_force
+            # --- FISICA UNIFICATA ---
+            brain.angle, brain.velocity = compute_step(
+                angle=brain.angle,
+                velocity=brain.velocity,
+                steer_raw=steer_raw,
+                speed_raw=speed_raw,
+                confidence=brain.confidence
+            )
 
+            # Movimento reale
+            rad = math.radians(brain.angle)
             brain.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * brain.velocity
-            
+
+            # Anti-incastro
             if old_pos.distance_to(brain.pos) < 0.5:
                 brain.stuck_timer += 1
             else:
                 brain.stuck_timer = 0
 
-            # punizione se si incastra
             if brain.stuck_timer > 20:
                 brain.score -= 20
                 brain.angle += random.uniform(-30, 30)
                 brain.stuck_timer = 0
-            
+
+            # Punteggio di avanzamento e stabilità
             brain.score += old_pos.distance_to(brain.pos) * 0.5
             brain.score += (1.0 - abs(steer_raw)) * 0.1
-            # penalizza andare troppo veloce (spinge a usare velocità controllata)
             brain.score -= brain.velocity * 0.01
-            
-            # --- UNICA LOGICA DI ARRIVO: I CHECKPOINT ---
-            if brain.next_cp < len(checkpoints):
-                target_cp = checkpoints[brain.next_cp]
-                dist_to_cp = brain.pos.distance_to(pygame.Vector2(target_cp))
-                
-                if dist_to_cp < 70: 
-                    brain.score += 8000 
-                    brain.next_cp += 1 
 
-                    # IL TRAGUARDO
+            # --- CONTROLLO ATTRAVERSAMENTO CHECKPOINT (GATE INTERSECTION) ---
+            if brain.next_cp < len(checkpoints):
+                gate = checkpoints[brain.next_cp]
+                p1 = (old_pos.x, old_pos.y)
+                p2 = (brain.pos.x, brain.pos.y)
+
+                if check_line_intersection(p1, p2, gate[0], gate[1]):
+                    sector_idx = brain.next_cp
+                    base_reward = 8000
+                    weighted_reward = base_reward * brain.sector_weights[sector_idx]
+                    brain.score += weighted_reward
+                    
+                    # Tracciamento per pesi adattivi
+                    brain.cp_crossed_flags[sector_idx] = 1
+                    brain.next_cp += 1
+
                     if brain.next_cp >= len(checkpoints):
                         finish_count += 1
                         brain.completed = True
-                        
-                        # PREMIO POSIZIONE: Il 1° prende più del 2°, ecc.
-                        # Esempio: 1° = 10.000, 2° = 9.000, 3° = 8.000...
                         premio_posizione = max(1000, 10000 - (finish_count - 1) * 1000)
-                        
-                        # PREMIO VELOCITÀ: Bonus basato sui frame totali (chi corre forte vince di più)
                         premio_velocita = max(500, 5000 - frame_count)
-                        
-                        brain.score += (premio_posizione + premio_velocita)
-                        
-                        print(f"PILOTA {population.index(brain)} ARRIVATO! Posizione: {finish_count} | Tempo: {frame_count}")
-                        # Se vuoi che la generazione finisca appena il PRIMO arriva:
+                        brain.score += (premio_posizione + premio_velocita) * brain.sector_weights[-1]
+                        print(f"PILOTA {population.index(brain)} ARRIVATO! Posizione: {finish_count}")
                         
             else:
                 # Caso di sicurezza: se per qualche motivo l'indice è già fuori, completa
@@ -238,13 +211,15 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
 
             # --- COLLISIONE ---
             try:
-                if track.get_at((int(brain.pos.x), int(brain.pos.y))).r < 30:
+                pixel = track.get_at((int(brain.pos.x), int(brain.pos.y)))
+                # Un muro è nero: Rosso < 30, Verde < 30, Blu < 30
+                if pixel.r < 30 and pixel.g < 30 and pixel.b < 30:
                     brain.alive = False
                     
                     # penalità base
                     brain.score -= 50
                     
-                    # penalità proporzionale alla velocità (chi muore veloce viene punito tantissimo)
+                    # penalità proporzionale alla velocità
                     brain.score -= brain.velocity * 20
             except:
                 brain.alive = False
@@ -263,23 +238,34 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
         clock.tick(240) # Aumentato a 120 per velocizzare l'allenamento visivo
 
 # --- EVOLUZIONE ---
-def evolve(population, spawn_pos, base_angle):
+def evolve(population, spawn_pos, base_angle, sector_weights):
     population.sort(key=lambda b: b.score, reverse=True)
-
     print(f"Best score: {int(population[0].score)}")
-
-    elite = population[:5]
+    
+    # 1. Ampliamo l'Elite
+    ELITE_SIZE = 10
+    elite = population[:ELITE_SIZE]
     new_pop = elite.copy()
-
+    
+    # 2. Inseriamo individui casuali
+    num_random = int(POP_SIZE * 0.10)
+    for _ in range(num_random):
+        # Passa i sector_weights anche ai nuovi random
+        new_pop.append(Brain(spawn_pos, base_angle, sector_weights=sector_weights))
+        
+    # 3. Generiamo il resto con Crossover e Mutazione
     while len(new_pop) < POP_SIZE:
-        parent = random.choice(elite)
-        # Passa spawn_pos e base_angle, poi i nuovi pesi
-        mutation_strength = random.uniform(0.05, 0.3)
-        new_weights = parent.weights + np.random.normal(0, mutation_strength, parent.weights.shape)
-        new_pop.append(Brain(spawn_pos, base_angle, weights=new_weights))
-
+        p1, p2 = random.sample(elite, 2)
+        mask = np.random.rand(*p1.weights.shape) > 0.5
+        child_weights = np.where(mask, p1.weights, p2.weights)
+        
+        mutation_strength = random.uniform(0.05, 0.6)
+        child_weights += np.random.normal(0, mutation_strength, child_weights.shape)
+        
+        # Passa i pesi e i sector_weights al figlio
+        new_pop.append(Brain(spawn_pos, base_angle, weights=child_weights, sector_weights=sector_weights))
+        
     return new_pop
-
 
 # --- MAIN ---
 def main():
@@ -308,39 +294,46 @@ def main():
     try:
         with open(f"tracks_config/{TRACK_NAME}.pkl", "rb") as f:
             config = pickle.load(f)
-        
-        # Estraiamo tutto dal dizionario
         checkpoints = config["checkpoints"]
         spawn_pos = pygame.Vector2(config["spawn_pos"])
         base_angle = config["base_angle"]
-        
         print(f"Track caricato correttamente!")
-        print(f"Checkpoints: {len(checkpoints)} | Start Angle: {base_angle:.1f}°")
-        
     except (FileNotFoundError, KeyError):
-        print("Errore: Il file track_config.pkl è assente o corrotto. Rigenera la pista!")
+        print("Errore: Il file track_config.pkl è assente o corrotto.")
         return
 
-    
-    spawn_pos = find_spawn(track)
-    base_angle = -90
-    
-    generation = 0 
-    
-    saved_weights = load_model()
+    # --- NUOVO: Calcola i pesi dei settori ---
+    sector_weights = compute_sector_weights(checkpoints, spawn_pos)
+    print(f"Pesi settori iniziali: {[round(w, 2) for w in sector_weights]}")
 
-    population = [Brain(spawn_pos, base_angle) for _ in range(POP_SIZE)]
+    generation = 0 
+    saved_weights = load_model()
+    
+    # Crea la popolazione iniziale passando i sector_weights
     if saved_weights is not None:
         population = [
-            Brain(spawn_pos, base_angle, weights=saved_weights + np.random.normal(0, 0.05, saved_weights.shape))
+            Brain(spawn_pos, base_angle, 
+                  weights=saved_weights + np.random.normal(0, 0.05, saved_weights.shape), 
+                  sector_weights=sector_weights) # Passa i pesi
+            for _ in range(POP_SIZE)
+        ]
+    else:
+        population = [
+            Brain(spawn_pos, base_angle, sector_weights=sector_weights) 
             for _ in range(POP_SIZE)
         ]
 
     while True:
         run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle, checkpoints)
-        # Salva il migliore di ogni generazione automaticamente
+        
+        # Salva il migliore
         save_model(population[0]) 
-        population = evolve(population, spawn_pos, base_angle)
+        
+        # --- NUOVO: Aggiorna i pesi in modo adattivo (opzionale, vedi punto avanzato) ---
+        # sector_weights = update_adaptive_weights(sector_weights, population, POP_SIZE)
+        
+        # Passa sector_weights a evolve
+        population = evolve(population, spawn_pos, base_angle, sector_weights)
         generation += 1
 
 def find_spawn(track):
@@ -353,6 +346,39 @@ def find_spawn(track):
                 return pygame.Vector2(x, y)
 
     return pygame.Vector2(400, 300)  # fallback
+
+def compute_sector_weights(checkpoints, spawn_pos):
+    """
+    Calcola il peso di ogni settore (tra checkpoint i-1 e i).
+    Combina:
+      - Fattore progressivo (settori finali valgono fino a 1.5x)
+      - Fattore distanza (settori lunghi valgono di più)
+    """
+    n = len(checkpoints)
+    weights = np.ones(n)
+    
+    # Centro di ogni gate (per stimare la lunghezza del settore)
+    gate_centers = []
+    for cp in checkpoints:
+        p1, p2 = cp
+        mid = pygame.Vector2((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+        gate_centers.append(mid)
+    
+    prev_point = spawn_pos
+    for i in range(n):
+        # Distanza del settore i
+        dist = prev_point.distance_to(gate_centers[i])
+        dist_factor = max(0.5, min(2.0, dist / 100.0))   # 100px = peso 1.0
+        
+        # Progressivo: da 1.0 (settore 0) a 1.5 (settore finale)
+        prog_factor = 1.0 + (i / max(1, n - 1)) * 0.5
+        
+        weights[i] = dist_factor * prog_factor
+        prev_point = gate_centers[i]
+    
+    # Normalizza così che la media resti ~1 (scala simile al 8000 originale)
+    weights = weights * (n / weights.sum())
+    return weights
 
 if __name__ == "__main__":
     main()

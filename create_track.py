@@ -115,18 +115,39 @@ class Editor:
         surf.fill((0, 0, 0))
         
         if len(pts) > 1:
-            for p in pts: pygame.draw.circle(surf, (255, 255, 255), (int(p[0]), int(p[1])), TRACK_WIDTH // 2)
-            # Traguardo Bianco
+            for p in pts: 
+                pygame.draw.circle(surf, (255, 255, 255), (int(p[0]), int(p[1])), TRACK_WIDTH // 2)
             self.draw_finish_line(surf, self.spawn_pos, self.spawn_angle, color=(0, 255, 0), width=12)
+
+        # --- CALCOLO CHECKPOINT GATE (Segmenti Perpendicolari) ---
+        checkpoint_gates = []
+        step_cp = 20
+        gate_width = TRACK_WIDTH - 10  # Più stretto per evitare tagli agli incroci
+        
+        for i in range(0, len(pts), step_cp):
+            p_curr = pygame.Vector2(pts[i])
+            p_next = pygame.Vector2(pts[(i + 1) % len(pts)])
+            
+            direction = (p_next - p_curr)
+            if direction.length_squared() > 0:
+                direction = direction.normalize()
+            else:
+                direction = pygame.Vector2(1, 0)
+                
+            normal = pygame.Vector2(-direction.y, direction.x)
+            g_start = p_curr + normal * (gate_width / 2)
+            g_end = p_curr - normal * (gate_width / 2)
+            
+            checkpoint_gates.append(((g_start.x, g_start.y), (g_end.x, g_end.y)))
 
         pygame.image.save(surf, "pista_gara.png")
         with open("tracks_config/pista_gara.pkl", "wb") as f:
             pickle.dump({
-                "checkpoints": pts[::20], 
+                "checkpoints": checkpoint_gates, 
                 "spawn_pos": (self.spawn_pos.x, self.spawn_pos.y), 
                 "base_angle": self.spawn_angle
             }, f)
-        print("Salvataggio completato: Immagine con traguardo linea creata.")
+        print("Salvataggio completato: Immagine e checkpoint gate salvati.")
 
     def draw_finish_line(self, surface, pos, angle, color=(0, 255, 0), width=10):
         """Disegna la linea di traguardo perpendicolare alla direzione"""

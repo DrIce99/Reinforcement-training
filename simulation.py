@@ -5,6 +5,8 @@ import pickle
 import os
 import json
 
+from physics import compute_step, check_line_intersection
+
 # --- CONFIGURAZIONE GARA ---
 # WIDTH, HEIGHT = 800, 600
 NUM_RACERS = 20  # Numero di partecipanti alla gara
@@ -40,133 +42,117 @@ class Racer:
         self.aggressiveness = random.uniform(0.9, 1.15)   # quanto spinge
         self.precision = random.uniform(0.85, 1.1)        # quanto è pulito nello sterzo
         self.risk_taking = random.uniform(0.9, 1.2)       # quanto rischia in curva
+        self.confidence = 0.0
 
         self.weights += np.random.normal(0, 0.02, self.weights.shape)
+        
+        self.chaos_factor = random.uniform(0.02, 0.12)  # Quanto è "sloppy" nello sterzo
+        self.imitation_rate = random.uniform(0.001, 0.01)  # Quanto impara dagli altri
 
     def predict(self, sensors):
         output = np.dot(sensors, self.weights)
-        return np.tanh(output)
+        self.confidence = float(np.mean(sensors) - np.std(sensors))
+        
+        # Aggiungiamo rumore (caos) per rompere i loop deterministici
+        noise = np.random.normal(0, self.chaos_factor, output.shape)
+        action = np.tanh(output + noise)
+        
+        return action
 
     def update(self, track_image, spawn_pos, total_laps, racers):
         if not self.alive or self.completed:
             return
 
         self.time += 1
-        # Lettura sensori (stessa logica del training)
         sensors = self.get_sensors(track_image)
-        
         self.learn_on_the_fly(sensors)
         action = self.predict(sensors)
 
-        # Movimento
-        # --- CONTROLLO ---
-        steer_raw = action[0]
-        speed_raw = action[1]
-
-        # sterzo base
-        steer = steer_raw * 5 * self.precision
-
-        # velocità base (come training)
-        base_speed = (2 + (speed_raw + 1) * 5) * self.aggressiveness
+        steer_raw, speed_raw = action[0], action[1]
 
                 # --- AGGRESSIVITÀ DINAMICA (inseguimento) ---
         boost = 1.0
 
+        # --- AGGRESSIVITÀ DINAMICA E APPRENDIMENTO SOCIALE ---
+        boost = 1.0
+        best_nearby_racer = None
+        min_obs_dist = 150 # Distanza massima per "studiare" un avversario
+
         for other in racers:
-            if other is self or not other.alive:
-                continue
-            
+            if other is self or not other.alive: continue
             dist = self.pos.distance_to(other.pos)
             
-            if dist < 120:
-                # verifica se è davanti
+            if dist < min_obs_dist:
                 rad = math.radians(self.angle)
                 forward = pygame.Vector2(math.cos(rad), math.sin(rad))
                 direction_vec = other.pos - self.pos
-
-                # evita vettore nullo
+                
                 if direction_vec.length_squared() > 0.0001:
-                    direction = direction_vec.normalize()
-                else:
-                    continue
-                
-                dot = forward.dot(direction)
-                
-                if dot > 0.5:  # è davanti
-                    boost += 0.15 * (1 - dist / 120)
+                    # Controlla se l'altro pilota è DAVANTI a noi
+                    if forward.dot(direction_vec.normalize()) > 0.5:
+                        # Effetto scia (boost)
+                        boost += 0.02 * (1 - dist / 120)
+                        
+                        # Logica di Imitazione: se chi ho davanti ha uno score/laps migliore del mio
+                        my_progress = (self.laps * 10000) + self.score
+                        other_progress = (other.laps * 10000) + other.score
+                        
+                        if other_progress > my_progress:
+                            best_nearby_racer = other
+                            min_obs_dist = dist # Aggiorna per trovare quello più vicino davanti
 
+        # Apprendi dal pilota davanti (copia una piccola parte dei suoi pesi)
+        if best_nearby_racer is not None:
+            # Crea una maschera casuale per copiare solo alcune sinapsi, non tutte
+            mask = np.random.rand(*self.weights.shape) < self.imitation_rate
+            self.weights[mask] = best_nearby_racer.weights[mask]
 
-        # --- PENALITÀ CURVA ---
-        turn_intensity = abs(steer_raw)
-        curve_penalty = 1.0 - (turn_intensity * 0.8 * self.risk_taking)
-        curve_penalty *= (1.0 - (boost - 1.0) * 0.3)
+        # --- FISICA UNIFICATA CON PARAMETRI PERSONALITÀ ---
+        # Applicazione dell'aggressività condizionata dal boost scia
+        effective_aggressiveness = self.aggressiveness * min(boost, 1.25)
 
-        # bonus rettilineo
-        straight_bonus = 1.0 + ((1.0 - turn_intensity) * 0.5)
+        self.angle, self.velocity = compute_step(
+            angle=self.angle,
+            velocity=self.velocity,
+            steer_raw=steer_raw,
+            speed_raw=speed_raw,
+            confidence=self.confidence,
+            precision=self.precision,
+            aggressiveness=effective_aggressiveness,
+            risk_taking=self.risk_taking
+        )
 
-        speed = base_speed * curve_penalty * straight_bonus
-        
-        # applica boost ma senza esagerare
-        speed *= min(boost, 1.25)
-
-        # soft cap velocità
-        speed = speed * (1.0 - (speed / 10.0) * 0.5)
-        speed = max(0.5, min(speed, 8))
-
-        # --- GRIP (meno sterzo ad alta velocità) ---
-        grip = max(0.2, 1.0 - self.velocity * 0.08)
-        self.angle += steer * grip
-
-        # --- INERZIA ---
-        acceleration = 0.03
-        brake_force = 0.08
-
-        if speed > self.velocity:
-            self.velocity += (speed - self.velocity) * acceleration
-        else:
-            self.velocity += (speed - self.velocity) * brake_force
-
-        # movimento reale
-        rad = math.radians(self.angle)
         old_pos = self.pos.copy()
+        rad = math.radians(self.angle)
         self.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * self.velocity
 
-        # --- SCORE MOVIMENTO ---
+        # Score e penalità sterzo
         self.score += old_pos.distance_to(self.pos) * 0.5
-
-        # penalità zig-zag
         steer_change = abs(steer_raw - self.prev_steer)
         self.score -= steer_change * 2.0
-
-        # penalità sterzate continue
         self.score -= abs(steer_raw) * 0.2
-
         self.prev_steer = steer_raw
         
+        np.clip(self.weights, -2.0, 2.0, out=self.weights)
+
+        # Conteggio Giri tramite Spawn Distance
         dist_to_spawn = self.pos.distance_to(spawn_pos)
-        
         if dist_to_spawn > 150:
             self.can_score_lap = True
             
-        # 2. Se torna vicino allo spawn ed è "abilitato", conta il giro
         if self.can_score_lap and dist_to_spawn < 40:
             self.laps += 1
             self.can_score_lap = False
-            print(f"Pilota {self.id} ha completato il giro {self.laps}!")
-            
             if self.laps >= total_laps:
                 self.completed = True
-                self.finish_time = self.time # Salva il tempo totale
+                self.finish_time = self.time
 
-        # Controllo Collisione (Nero = Muro)
+        # Controllo Collisioni Pista (Nero = Muro)
         try:
             pixel = track_image.get_at((int(self.pos.x), int(self.pos.y)))
             if pixel.r < 30 and pixel.g < 30 and pixel.b < 30:
                 self.alive = False
-                
-                # penalità forte se si schianta veloce
-                self.score -= 50
-                self.score -= self.velocity * 200
+                self.score -= 50 + self.velocity * 200
         except IndexError:
             self.alive = False
 

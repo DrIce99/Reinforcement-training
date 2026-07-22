@@ -16,7 +16,6 @@ class Pilot:
         self.sensors = [0.0] * NUM_SENSORS # Output dei sensori (0.0 a 1.0)
 
     def cast_sensors(self, screen_map):
-        """Proietta i raggi e misura la distanza dai muri (pixel neri)"""
         start_angle = self.angle - (SENSOR_ANGLE_RANGE / 2)
         step = SENSOR_ANGLE_RANGE / (NUM_SENSORS - 1)
 
@@ -24,21 +23,18 @@ class Pilot:
             angle_rad = math.radians(start_angle + (i * step))
             dist = 0
             
-            # Allunga il raggio finché non tocca un muro o raggiunge il limite
             while dist < MAX_SENSOR_LEN:
-                dist += 2
+                dist += 4
                 test_x = int(self.pos.x + math.cos(angle_rad) * dist)
                 test_y = int(self.pos.y + math.sin(angle_rad) * dist)
 
-                # Controllo collisione pixel (se fuori schermo o pixel nero = muro)
                 try:
                     pixel = screen_map.get_at((test_x, test_y))
-                    if pixel[0] < 50: # Se il colore tende al nero
+                    if pixel.r < 50 and pixel.g < 50 and pixel.b < 50:
                         break
                 except IndexError:
                     break
             
-            # Normalizziamo la distanza (0 = muro addosso, 1 = strada libera)
             self.sensors[i] = dist / MAX_SENSOR_LEN
 
     def update(self, action):
