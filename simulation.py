@@ -46,6 +46,12 @@ class Racer:
 
         self.weights += np.random.normal(0, 0.02, self.weights.shape)
         
+        # --- STATO DELLE GOMME ---
+        self.tyre_health = 100.0       # Da 100 (perfette) a 0 (distrutte)
+        self.tyre_fragility = random.uniform(0.9, 1.1) # Alcune auto consumano di più
+        self.prev_speed_raw = 0
+        
+        # --- CAOS E APPRENDIMENTO ---
         self.chaos_factor = random.uniform(0.02, 0.12)  # Quanto è "sloppy" nello sterzo
         self.imitation_rate = random.uniform(0.001, 0.01)  # Quanto impara dagli altri
 
@@ -53,10 +59,12 @@ class Racer:
         output = np.dot(sensors, self.weights)
         self.confidence = float(np.mean(sensors) - np.std(sensors))
         
-        # Aggiungiamo rumore (caos) per rompere i loop deterministici
-        noise = np.random.normal(0, self.chaos_factor, output.shape)
-        action = np.tanh(output + noise)
+        # 1. Caos base del pilota + Caos dovuto alle gomme usurate
+        # Se le gomme sono al 50%, il caos raddoppia. A 0%, triplica.
+        tyre_chaos = self.chaos_factor * (1.0 + (1.0 - self.tyre_health / 100.0) * 2.0)
+        noise = np.random.normal(0, tyre_chaos, output.shape)
         
+        action = np.tanh(output + noise)
         return action
 
     def update(self, track_image, spawn_pos, total_laps, racers):
@@ -76,7 +84,7 @@ class Racer:
         # --- AGGRESSIVITÀ DINAMICA E APPRENDIMENTO SOCIALE ---
         boost = 1.0
         best_nearby_racer = None
-        min_obs_dist = 150 # Distanza massima per "studiare" un avversario
+        min_obs_dist = 150
 
         for other in racers:
             if other is self or not other.alive: continue
@@ -88,29 +96,51 @@ class Racer:
                 direction_vec = other.pos - self.pos
                 
                 if direction_vec.length_squared() > 0.0001:
-                    # Controlla se l'altro pilota è DAVANTI a noi
                     if forward.dot(direction_vec.normalize()) > 0.5:
-                        # Effetto scia (boost)
                         boost += 0.02 * (1 - dist / 120)
                         
-                        # Logica di Imitazione: se chi ho davanti ha uno score/laps migliore del mio
                         my_progress = (self.laps * 10000) + self.score
                         other_progress = (other.laps * 10000) + other.score
                         
                         if other_progress > my_progress:
                             best_nearby_racer = other
-                            min_obs_dist = dist # Aggiorna per trovare quello più vicino davanti
+                            min_obs_dist = dist 
 
-        # Apprendi dal pilota davanti (copia una piccola parte dei suoi pesi)
         if best_nearby_racer is not None:
-            # Crea una maschera casuale per copiare solo alcune sinapsi, non tutte
             mask = np.random.rand(*self.weights.shape) < self.imitation_rate
             self.weights[mask] = best_nearby_racer.weights[mask]
 
-        # --- FISICA UNIFICATA CON PARAMETRI PERSONALITÀ ---
-        # Applicazione dell'aggressività condizionata dal boost scia
-        effective_aggressiveness = self.aggressiveness * min(boost, 1.25)
+        # --- USURA GOMME ---
+        # 1. Usura costante per la velocità
+        wear_base = self.velocity * 0.0005
+        
+        # 2. Usura per le curve ad alta velocità (stress laterale)
+        wear_cornering = abs(steer_raw) * self.velocity * 0.008
+        
+        # 3. Usura per accelerazioni violente
+        wear_accel = max(0, speed_raw) * 0.002
+        
+        # 4. Usura per FRENTAE IMPROVVISE (se il comando accel cala drasticamente)
+        brake_intensity = max(0, self.prev_speed_raw - speed_raw)
+        wear_braking = brake_intensity * 0.015  # Le staccate violente consumano molto!
+        self.prev_speed_raw = speed_raw  # Salva per il frame prossimo
+        
+        # Applichiamo l'usura
+        self.tyre_health -= (wear_base + wear_cornering + wear_accel + wear_braking) * self.tyre_fragility
+        self.tyre_health = max(0, self.tyre_health) # Non scende sotto lo 0%
+        
+        # Effetto delle gomme sulle performance (potenza motore)
+        tyre_penalty = 0.5 + 0.5 * (self.tyre_health / 100.0)
+        
+        # Sbandata macroscopica se le gomme sono messe male
+        if self.tyre_health < 50 and random.random() < (50 - self.tyre_health) * 0.0008:
+            steer_raw += random.uniform(-1.0, 1.0)
+            self.score -= 50  
 
+        # --- FISICA UNIFICATA CON GOMME ---
+        effective_aggressiveness = self.aggressiveness * min(boost, 1.25) * tyre_penalty
+
+        # Passiamo tyre_health a compute_step!
         self.angle, self.velocity = compute_step(
             angle=self.angle,
             velocity=self.velocity,
@@ -119,7 +149,8 @@ class Racer:
             confidence=self.confidence,
             precision=self.precision,
             aggressiveness=effective_aggressiveness,
-            risk_taking=self.risk_taking
+            risk_taking=self.risk_taking,
+            tyre_health=self.tyre_health 
         )
 
         old_pos = self.pos.copy()
@@ -281,8 +312,21 @@ def main():
         active_racers = [r for r in racers if r.alive and not r.completed]
         for r in racers:
             r.update(track, spawn_pos, LAPS_TO_WIN, racers)
+            
+            # Colore pilota o grigio se morto
             color = r.color if r.alive else (50, 50, 50)
             pygame.draw.circle(screen, color, (int(r.pos.x), int(r.pos.y)), 6)
+            
+            # DISEGNO STATO GOMME (Cerchio esterno)
+            if r.alive:
+                # Colore da Verde (100%) a Rosso (0%)
+                tyre_color = (
+                    int(255 * (1 - r.tyre_health / 100)),  # Rosso aumenta
+                    int(255 * (r.tyre_health / 100)),      # Verde diminuisce
+                    0
+                )
+                # Disegna un anello intorno alla macchina
+                pygame.draw.circle(screen, tyre_color, (int(r.pos.x), int(r.pos.y)), 9, 2)
             
             # Mostra Giri/Totale sopra ogni pilota
             # lap_txt = font.render(f"{r.laps}/{LAPS_TO_WIN}", True, (255, 255, 255))
