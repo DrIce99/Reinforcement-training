@@ -1,3 +1,5 @@
+import argparse
+import glob
 import pygame
 import numpy as np
 import math
@@ -5,21 +7,24 @@ import pickle
 import os
 import json
 import random
-import sys
 
 from physics import compute_step
-from track import SENSOR_COUNT, load_track, navigation_inputs, adapt_weights
+from speed_control import SpeedControl
+from track import (SENSOR_COUNT, list_tracks, load_track, navigation_inputs, adapt_weights,
+                   view_scale, scaled_view)
 from window_state import restore_window_position, close_window
 
 # --- CONFIGURAZIONE GARA ---
 NUM_RACERS = 20  # Numero di partecipanti alla gara
-LAPS_TO_WIN = 7
-MAX_FRAMES_PER_LAP = 6000  # Chi non completa un giro in questo tempo (es. gira in tondo) è fuori
+LAPS_TO_WIN = 7  # Giri per gara (modificabile con --giri)
+MAX_FRAMES_WITHOUT_GATE = 1000  # Chi non raggiunge il gate successivo in tempo (es. gira in tondo) è fuori
 POINTS_SYSTEM = [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]
 LEADERBOARD_FILE = "leaderboard.json"
 
-# Uso: python simulation.py [nome_pista]
-TRACK_NAME = sys.argv[1] if len(sys.argv) > 1 else "pista_gara"
+# Uso:
+#   python simulation.py                       campionato su tutte le piste in tracks_config/
+#   python simulation.py pista_a pista_b       campionato su queste piste, in quest'ordine
+#   python simulation.py pista_a --giri 3      gara singola da 3 giri
 WINDOW_KEY = "simulation"
 
 # --- CLASSE PILOTA GARA ---
@@ -38,7 +43,7 @@ class Racer:
         self.laps = 0
         self.next_cp = 0  # Prossimo gate da attraversare: il giro conta solo passandoli tutti in ordine
         self.finish_time = 0
-        self.last_lap_time = 0
+        self.last_gate_time = 0
 
         self.learning_rate = 0.01  # Quanto velocemente cambia idea
         self.prev_dist_to_walls = 0
@@ -195,16 +200,16 @@ class Racer:
             return
         if passed:
             self.next_cp += 1
+            self.last_gate_time = self.time
             if self.next_cp >= len(gates):
                 self.next_cp = 0
                 self.laps += 1
-                self.last_lap_time = self.time
                 if self.laps >= total_laps:
                     self.completed = True
                     self.finish_time = self.time
                     return
 
-        if self.time - self.last_lap_time > MAX_FRAMES_PER_LAP:
+        if self.time - self.last_gate_time > MAX_FRAMES_WITHOUT_GATE:
             self.alive = False
 
     def get_sensors(self, track):
@@ -242,26 +247,35 @@ class Racer:
             self.weights += mutation
 
 # --- FUNZIONI DI SUPPORTO ---
-def load_best_weights():
-    path = f"tracks/{TRACK_NAME}.pkl"
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            return adapt_weights(pickle.load(f))
-    return None
+def load_best_weights(track_name):
+    """
+    Modello addestrato per la pista. Se manca usa il modello addestrato più recente
+    di un'altra pista (la guida di base si trasferisce), avvisando l'utente.
+    """
+    path = f"tracks/{track_name}.pkl"
+    if not os.path.exists(path):
+        others = sorted(glob.glob("tracks/*.pkl"), key=os.path.getmtime, reverse=True)
+        if not others:
+            return None
+        path = others[0]
+        print(f"Attenzione: nessun addestramento per '{track_name}', uso {path}. "
+              f"Per risultati migliori: python training.py {track_name}")
+    with open(path, "rb") as f:
+        return adapt_weights(pickle.load(f))
 
-def driver_weights_path(racer_id):
-    return f"single/{TRACK_NAME}/driver_{racer_id}.pkl"
+def driver_weights_path(track_name, racer_id):
+    return f"single/{track_name}/driver_{racer_id}.pkl"
 
-def get_driver_weights(racer_id, base_weights):
-    filename = driver_weights_path(racer_id)
+def get_driver_weights(track_name, racer_id, base_weights):
+    filename = driver_weights_path(track_name, racer_id)
     if os.path.exists(filename):
         with open(filename, "rb") as f:
             return adapt_weights(pickle.load(f))
     # Se è nuovo, parte dal DNA del training + una piccola variazione casuale
     return base_weights + np.random.normal(0, 0.05, base_weights.shape)
 
-def save_driver_weights(racer_id, weights):
-    filename = driver_weights_path(racer_id)
+def save_driver_weights(track_name, racer_id, weights):
+    filename = driver_weights_path(track_name, racer_id)
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "wb") as f:
         pickle.dump(weights, f)
@@ -286,6 +300,13 @@ def safe_save_json(filename, data):
     with open(temp_file, "w", encoding='utf-8') as f:
         json.dump(data, f, indent=4)
     os.replace(temp_file, filename)
+
+def readable(color, min_brightness=110):
+    """Schiarisce i colori troppo scuri per essere letti sullo sfondo scuro."""
+    brightness = max(color)
+    if brightness >= min_brightness:
+        return tuple(color)
+    return tuple(int(c + (min_brightness - brightness) + 40) for c in color)
 
 def race_points(position):
     return POINTS_SYSTEM[position] if position < len(POINTS_SYSTEM) else 0
@@ -313,45 +334,90 @@ BASE_COLORS = [
     (153, 120, 181) # Lilla
 ]
 
-# --- MAIN GARA ---
+class RaceTrack:
+    """Una tappa del campionato: pista caricata e modello addestrato."""
+    def __init__(self, name):
+        self.name = name
+        self.image, self.spawn_pos, self.base_angle, self.gates = load_track(name)
+        self.weights = load_best_weights(name)
+        self.scale = view_scale(self.image.get_size())  # Le piste grandi vengono mostrate ridotte
+        self.window_size = (round(self.image.get_width() * self.scale), round(self.image.get_height() * self.scale))
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Gara / campionato tra i piloti IA")
+    parser.add_argument("piste", nargs="*",
+                        help="piste del campionato, in ordine (default: tutte quelle in tracks_config/)")
+    parser.add_argument("--giri", type=int, default=LAPS_TO_WIN, help=f"giri per gara (default: {LAPS_TO_WIN})")
+    return parser.parse_args()
+
+# --- MAIN: CAMPIONATO ---
 def main():
-    pygame.init()
-    try:
-        track_temp, spawn_pos, base_angle, gates = load_track(TRACK_NAME)
-    except (pygame.error, FileNotFoundError, KeyError) as e:
-        print(f"Errore: impossibile caricare la pista '{TRACK_NAME}': {e}")
+    args = parse_args()
+    names = args.piste or list_tracks()
+    if not names:
+        print("Nessuna pista trovata: creane una con generate_track.py o create_track.py")
         return
+
+    pygame.init()
+    tracks = []
+    for name in names:
+        try:
+            race_track = RaceTrack(name)
+        except (pygame.error, FileNotFoundError, KeyError) as e:
+            print(f"Pista '{name}' saltata: impossibile caricarla ({e})")
+            continue
+        if race_track.weights is None:
+            print(f"Pista '{name}' saltata: nessun modello addestrato. Esegui: python training.py {name}")
+            continue
+        tracks.append(race_track)
+    if not tracks:
+        return
+
+    print(f"Campionato di {len(tracks)} gare: {', '.join(t.name for t in tracks)} ({args.giri} giri ciascuna)")
     restore_window_position(WINDOW_KEY)
-    screen = pygame.display.set_mode(track_temp.get_size())
-    track = track_temp.convert()
-    pygame.display.set_caption(f"GRAN PREMIO IA - {TRACK_NAME}")
+    screen = pygame.display.set_mode(tracks[0].window_size)
+    for t in tracks:
+        t.surface = t.image.convert()            # Pista a grandezza reale: la leggono i sensori
+        t.view = scaled_view(t.surface, t.scale)  # Pista ridotta per la finestra
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Arial", 18)
+    speed = SpeedControl(base_fps=120)  # Rimane impostata per tutto il campionato
 
-    # Caricamento intelligenza appresa
-    trained_weights = load_best_weights()
-    if trained_weights is None:
-        print(f"Errore: Nessun addestramento trovato! Esegui prima: python training.py {TRACK_NAME}")
-        return
+    while True:  # Ogni giro di questo ciclo è un campionato completo
+        championship = {}  # id pilota -> {"points", "wins", "color"}
+        for index, race_track in enumerate(tracks):
+            if screen.get_size() != race_track.window_size:
+                screen = pygame.display.set_mode(race_track.window_size)
+            pygame.display.set_caption(f"GRAN PREMIO IA - Gara {index + 1}/{len(tracks)}: {race_track.name}")
 
-    while True:
-        final_standings = run_race(screen, clock, font, track, spawn_pos, base_angle, gates, trained_weights)
-        if final_standings is None:  # Finestra chiusa durante la gara
-            return
-        finalize_race(final_standings)
-        if not show_post_race_screen(screen, clock, final_standings):
-            return
+            race_info = f"Gara {index + 1}/{len(tracks)}: {race_track.name}"
+            final_standings = run_race(screen, clock, font, speed, race_track, args.giri, race_info)
+            if final_standings is None:  # Finestra chiusa durante la gara
+                return
+            finalize_race(race_track.name, final_standings)
 
-def run_race(screen, clock, font, track, spawn_pos, base_angle, gates, trained_weights):
+            for i, r in enumerate(final_standings):
+                entry = championship.setdefault(r.id, {"points": 0, "wins": 0, "color": r.color})
+                entry["points"] += race_points(i)
+                entry["wins"] += i == 0
+
+            next_name = tracks[index + 1].name if index + 1 < len(tracks) else None
+            if not show_post_race_screen(screen, clock, final_standings, championship,
+                                         race_info, next_name, len(tracks)):
+                return
+
+def run_race(screen, clock, font, speed, race_track, laps, race_info):
     """Esegue una gara. Ritorna la classifica finale, oppure None se la finestra viene chiusa."""
     width = screen.get_width()
+    track, gates, scale = race_track.surface, race_track.gates, race_track.scale
+    spawn_pos, base_angle = race_track.spawn_pos, race_track.base_angle
 
     # Creazione Griglia di Partenza con colori diversi
     racers = []
     for i in range(NUM_RACERS):
         r_id = i + 1
         # Ogni pilota ha il proprio DNA salvato, oppure quello del training con una variazione casuale
-        individual_dna = get_driver_weights(r_id, trained_weights)
+        individual_dna = get_driver_weights(race_track.name, r_id, race_track.weights)
         color = BASE_COLORS[i % len(BASE_COLORS)]
         # Griglia di partenza: spostiamo ogni pilota di lato per non sovrapporli
         # (mai indietro, altrimenti ripasserebbe il traguardo al contrario)
@@ -363,16 +429,19 @@ def run_race(screen, clock, font, track, spawn_pos, base_angle, gates, trained_w
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return None
+            speed.handle_event(event)
 
-        screen.blit(track, (0, 0))
+        # Più passi di simulazione per frame quando la velocità è sopra x1
+        for _ in range(speed.steps_per_frame):
+            for r in racers:
+                r.update(track, gates, laps, racers)
 
-        # Aggiornamento e Disegno
+        screen.blit(race_track.view, (0, 0))
         for r in racers:
-            r.update(track, gates, LAPS_TO_WIN, racers)
-
+            pos = (int(r.pos.x * scale), int(r.pos.y * scale))
             # Colore pilota o grigio se morto
             color = r.color if r.alive else (50, 50, 50)
-            pygame.draw.circle(screen, color, (int(r.pos.x), int(r.pos.y)), 6)
+            pygame.draw.circle(screen, color, pos, 6)
 
             # DISEGNO STATO GOMME (Cerchio esterno)
             if r.alive:
@@ -383,26 +452,30 @@ def run_race(screen, clock, font, track, spawn_pos, base_angle, gates, trained_w
                     0
                 )
                 # Disegna un anello intorno alla macchina
-                pygame.draw.circle(screen, tyre_color, (int(r.pos.x), int(r.pos.y)), 9, 2)
+                pygame.draw.circle(screen, tyre_color, pos, 9, 2)
 
         # Classifica aggiornata con i giri
         racers.sort(key=lambda x: (x.progress(len(gates)), x.score), reverse=True)
         for i, r in enumerate(racers[:5]):
-            status = "VINTO!" if r.completed else ("OUT" if not r.alive else f"Giro {r.laps}")
-            entry = font.render(f"{i+1}. Pilota {r.id}: {status}", True, r.color)
-            screen.blit(entry, (width - 180, 20 + i * 25))
+            status = "VINTO!" if r.completed else ("OUT" if not r.alive else f"Giro {r.laps + 1}/{laps}")
+            entry = font.render(f"{i+1}. Pilota {r.id}: {status}", True, readable(r.color))
+            screen.blit(entry, (width - 200, 20 + i * 25))
+
+        info = font.render(f"{race_info} | {speed.label()}", True, (255, 255, 255))
+        pygame.draw.rect(screen, (0, 0, 0), (6, 6, info.get_width() + 12, info.get_height() + 6))
+        screen.blit(info, (12, 9))
 
         pygame.display.flip()
-        clock.tick(120)
+        speed.tick(clock)
 
         if not any(r.alive and not r.completed for r in racers):
             return racers  # Già ordinati per giri e punteggio
 
-def finalize_race(final_standings):
-    """Evoluzione del DNA e assegnazione punti: va chiamata UNA sola volta per gara."""
-    # 1. Evoluzione DNA
+def finalize_race(track_name, final_standings):
+    """Evoluzione del DNA e punti nella classifica storica: va chiamata UNA sola volta per gara."""
+    # 1. Evoluzione DNA (separato per ogni pista)
     winner = final_standings[0]
-    print(f"\nVince Pilota {winner.id}!")
+    print(f"\n[{track_name}] Vince Pilota {winner.id}!")
 
     for i, r in enumerate(final_standings):
         if i == 0:
@@ -414,9 +487,9 @@ def finalize_race(final_standings):
             r.weights = (winner.weights * 0.8) + (r.weights * 0.2)
             r.weights += np.random.normal(0, 0.03, r.weights.shape)
             print(f"{i+1}° Pilota {r.id}: apprende dal vincitore")
-        save_driver_weights(r.id, r.weights)
+        save_driver_weights(track_name, r.id, r.weights)
 
-    # 2. Assegnazione punti
+    # 2. Classifica storica (somma di tutte le gare mai disputate)
     leaderboard = safe_load_json(LEADERBOARD_FILE)
 
     print("\n--- PUNTI ASSEGNATI ---")
@@ -433,14 +506,21 @@ def finalize_race(final_standings):
 
     safe_save_json(LEADERBOARD_FILE, leaderboard)
 
-def show_post_race_screen(screen, clock, final_standings):
-    """Mostra classifica gara e campionato. Ritorna True per una nuova gara, False per uscire."""
+def show_post_race_screen(screen, clock, final_standings, championship, race_info, next_name, race_count):
+    """
+    Classifica della gara, del campionato in corso e storica.
+    Ritorna True per proseguire (gara successiva o nuovo campionato), False per uscire.
+    """
     width, height = screen.get_size()
+    col_x = [50, width // 3 + 20, 2 * width // 3 + 10]
 
     leaderboard = safe_load_json(LEADERBOARD_FILE)
-    generale = sorted(leaderboard.items(), key=lambda x: x[1]['score'], reverse=True)
+    storica = sorted(leaderboard.items(), key=lambda x: x[1]['score'], reverse=True)
+    campionato = sorted(championship.items(), key=lambda x: (x[1]["points"], x[1]["wins"]), reverse=True)
+    finished = next_name is None
 
-    title_font = pygame.font.SysFont("Arial", 32, bold=True)
+    title_font = pygame.font.SysFont("Arial", 30, bold=True)
+    banner_font = pygame.font.SysFont("Arial", 34, bold=True)
     pos_font = pygame.font.SysFont("Arial", 24, bold=True)
     data_font = pygame.font.SysFont("Arial", 20)
     hint_font = pygame.font.SysFont("Arial", 22)
@@ -449,6 +529,18 @@ def show_post_race_screen(screen, clock, final_standings):
     total = len(final_standings)
     survived = len([r for r in final_standings if r.alive])
     winners = len([r for r in final_standings if r.completed])
+
+    if finished:
+        hint_text = "SPACE = Nuovo Campionato | ESC = Esci" if race_count > 1 else "SPACE = Nuova Gara | ESC = Esci"
+    else:
+        hint_text = f"SPACE = Prossima gara: {next_name} | ESC = Esci"
+
+    def draw_row(x, i, name, line2, color, highlight):
+        pos_text = pos_font.render(f"{i+1}°", True, highlight if i == 0 else (255, 255, 255))
+        screen.blit(pos_text, (x + 10, 140 + i * 50))
+        screen.blit(data_font.render(name, True, readable(color)), (x + 70, 135 + i * 50))
+        screen.blit(data_font.render(line2, True, (220, 220, 220)), (x + 70, 157 + i * 50))
+        pygame.draw.circle(screen, color, (x + 55, 148 + i * 50), 8)
 
     while True:
         for event in pygame.event.get():
@@ -459,52 +551,37 @@ def show_post_race_screen(screen, clock, final_standings):
 
         screen.fill((15, 15, 25))  # Sfondo scuro elegante
 
-        # ========== HEADER ==========
-        title1 = title_font.render("CLASSIFICA GARA", True, (255, 215, 0))
-        title2 = title_font.render("CAMPIONATO", True, (0, 255, 150))
-        screen.blit(title1, (50, 30))
-        screen.blit(title2, (450, 30))
+        # ========== BANNER ==========
+        if finished and race_count > 1:
+            champ_id, champ = campionato[0]
+            banner = banner_font.render(f"CAMPIONATO CONCLUSO - Campione: Pilota {champ_id} ({champ['points']} pts)",
+                                        True, champ["color"])
+        else:
+            banner = banner_font.render(race_info, True, (255, 255, 255))
+        screen.blit(banner, ((width - banner.get_width()) // 2, 20))
 
-        # Linee decorative
-        pygame.draw.line(screen, (255, 215, 0), (50, 70), (350, 70), 3)
-        pygame.draw.line(screen, (0, 255, 150), (450, 70), (750, 70), 3)
+        # ========== INTESTAZIONI ==========
+        headers = [("CLASSIFICA GARA", (255, 215, 0)), ("CAMPIONATO", (0, 255, 150)), ("STORICA", (120, 180, 255))]
+        for x, (text, color) in zip(col_x, headers):
+            screen.blit(title_font.render(text, True, color), (x, 75))
+            pygame.draw.line(screen, color, (x, 115), (x + 380, 115), 3)
 
-        # ========== CLASSIFICA GARA (con punti gara + score) ==========
+        # ========== CLASSIFICA GARA ==========
         for i, r in enumerate(final_standings[:10]):
-            pos_color = (255, 215, 0) if i == 0 else (255, 255, 255) if i < 3 else (200, 200, 200)
+            draw_row(col_x[0], i, f"Pilota {r.id}", f"Score {r.score:.0f} | +{race_points(i)} pts", r.color, (255, 215, 0))
 
-            # Posizione grande
-            pos_text = pos_font.render(f"{i+1}°", True, pos_color)
-            screen.blit(pos_text, (60, 100 + i * 50))
+        # ========== CAMPIONATO IN CORSO ==========
+        for i, (r_id, info) in enumerate(campionato[:10]):
+            wins = f"{info['wins']} vittori{'a' if info['wins'] == 1 else 'e'}"
+            draw_row(col_x[1], i, f"Pilota {r_id}", f"{info['points']} pts | {wins}",
+                     info["color"], (0, 255, 150))
 
-            # Dati pilota
-            line1 = data_font.render(f"Pilota {r.id}", True, r.color)
-            line2 = data_font.render(f"Score {r.score:.0f} | +{race_points(i)} pts", True, (220, 220, 220))
-
-            screen.blit(line1, (120, 95 + i * 50))
-            screen.blit(line2, (120, 117 + i * 50))
-
-            # Cerchio colorato
-            pygame.draw.circle(screen, r.color, (105, 108 + i * 50), 8)
-
-        # ========== CAMPIONATO ==========
-        for i, (name, info) in enumerate(generale[:10]):
-            color = tuple(info["color"])
-
-            pos_text = pos_font.render(f"{i+1}°", True, (0, 255, 150) if i == 0 else (255, 255, 255))
-            screen.blit(pos_text, (460, 100 + i * 50))
-
-            name_text = data_font.render(name, True, color)
-            score_text = data_font.render(f"{info['score']} pts", True, (0, 255, 200))
-
-            screen.blit(name_text, (520, 95 + i * 50))
-            screen.blit(score_text, (520, 117 + i * 50))
-
-            # Quadrato colorato
-            pygame.draw.rect(screen, color, (503, 102 + i * 50, 12, 12))
+        # ========== CLASSIFICA STORICA ==========
+        for i, (name, info) in enumerate(storica[:10]):
+            draw_row(col_x[2], i, name, f"{info['score']} pts", tuple(info["color"]), (120, 180, 255))
 
         # ========== ISTRUZIONI ==========
-        hint = hint_font.render("SPACE = Nuova Gara | ESC = Esci", True, (150, 200, 255))
+        hint = hint_font.render(hint_text, True, (150, 200, 255))
         screen.blit(hint, ((width - hint.get_width()) // 2, height - 60))
 
         # Statistiche in basso

@@ -7,7 +7,9 @@ import os
 import sys
 
 from physics import compute_step
-from track import SENSOR_COUNT, INPUT_COUNT, load_track, navigation_inputs, adapt_weights
+from track import (SENSOR_COUNT, INPUT_COUNT, load_track, navigation_inputs, adapt_weights,
+                   view_scale, scaled_view)
+from speed_control import SpeedControl
 from window_state import restore_window_position, close_window
 
 # --- CONFIG ---
@@ -18,6 +20,7 @@ TRACK_NAME = sys.argv[1] if len(sys.argv) > 1 else "pista_gara"
 WINDOW_KEY = "training"
 MAX_FRAMES_WITHOUT_CP = 1000  # Elimina chi gira a vuoto senza raggiungere il checkpoint successivo
 WRONG_GATE_PENALTY = 3000     # Strada sbagliata a un incrocio, taglio o contromano
+REFERENCE_GATES = 36          # Gate della pista su cui è stato tarato il premio velocità
 
 # LOGICA DI SALVATAGGIO ---
 def save_model(brain):
@@ -116,142 +119,148 @@ def get_sensors(pos, angle, track):
 
 
 # --- SIMULAZIONE ---
-def run_simulation(population, track, background, screen, clock, font, generation, spawn_pos, base_angle, gates):
-    running = True
+def step_brain(brain, track, gates):
+    """Un passo di simulazione per un pilota. Ritorna True se ha appena completato il giro."""
+    sensors = get_sensors(brain.pos, brain.angle, track)
+    nav = navigation_inputs(brain.pos, brain.angle, gates, brain.next_cp)
+    action = brain.predict(sensors, nav)
+
+    steer_raw, speed_raw = action[0], action[1]
+    old_pos = brain.pos.copy()
+
+    # --- FISICA UNIFICATA ---
+    brain.angle, brain.velocity = compute_step(
+        angle=brain.angle,
+        velocity=brain.velocity,
+        steer_raw=steer_raw,
+        speed_raw=speed_raw,
+        confidence=brain.confidence
+    )
+
+    # Movimento reale
+    rad = math.radians(brain.angle)
+    brain.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * brain.velocity
+
+    # Anti-incastro
+    if old_pos.distance_to(brain.pos) < 0.5:
+        brain.stuck_timer += 1
+    else:
+        brain.stuck_timer = 0
+
+    if brain.stuck_timer > 20:
+        brain.score -= 20
+        brain.angle += random.uniform(-30, 30)
+        brain.stuck_timer = 0
+
+    # Punteggio di avanzamento e stabilità
+    brain.score += old_pos.distance_to(brain.pos) * 0.5
+    brain.score += (1.0 - abs(steer_raw)) * 0.1
+    brain.score -= brain.velocity * 0.01
+
+    just_completed = False
+
+    # --- CONTROLLO ATTRAVERSAMENTO CHECKPOINT (GATE INTERSECTION) ---
+    if brain.next_cp < len(gates):
+        passed, wrong_way = gates.check_progress(old_pos, brain.pos, brain.next_cp)
+
+        if wrong_way:
+            # Ha attraversato un gate fuori sequenza: strada sbagliata a un incrocio
+            brain.alive = False
+            brain.score -= WRONG_GATE_PENALTY
+        elif passed:
+            sector_idx = brain.next_cp
+            base_reward = 8000
+            weighted_reward = base_reward * brain.sector_weights[sector_idx]
+            brain.score += weighted_reward
+
+            # Tracciamento per pesi adattivi
+            brain.cp_crossed_flags[sector_idx] = 1
+            brain.next_cp += 1
+            brain.frames_since_cp = 0
+
+            if brain.next_cp >= len(gates):
+                brain.completed = True
+                just_completed = True
+    else:
+        # Caso di sicurezza: se per qualche motivo l'indice è già fuori, completa
+        brain.completed = True
+
+    # Chi non raggiunge il checkpoint successivo in tempo (es. gira in tondo) viene eliminato,
+    # altrimenti la generazione non terminerebbe mai
+    brain.frames_since_cp += 1
+    if not brain.completed and brain.frames_since_cp > MAX_FRAMES_WITHOUT_CP:
+        brain.alive = False
+
+    # --- COLLISIONE ---
+    try:
+        pixel = track.get_at((int(brain.pos.x), int(brain.pos.y)))
+        # Un muro è nero: Rosso < 30, Verde < 30, Blu < 30
+        if brain.alive and pixel.r < 30 and pixel.g < 30 and pixel.b < 30:
+            brain.alive = False
+
+            # penalità base
+            brain.score -= 50
+
+            # penalità proporzionale alla velocità
+            brain.score -= brain.velocity * 20
+    except IndexError:
+        brain.alive = False
+
+    return just_completed
+
+
+def run_simulation(population, track, background, scale, screen, clock, font, generation, spawn_pos, base_angle, gates, speed):
     finish_count = 0 # Conta quanti hanno finito il giro
-    frame_count = 0  # Timer della simulazione
-    skip_generation = False
+    frame_count = 0  # Timer della simulazione (in passi, indipendente dalla velocità di visualizzazione)
 
     for brain in population:
         brain.reset(spawn_pos, base_angle)
 
-    while running:
-        frame_count += 1
+    while True:
         for event in pygame.event.get():
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_s:  # premi S per skippare
-                    skip_generation = True
-            
-            if skip_generation:
+            if event.type == pygame.QUIT:
+                sys.exit()  # La finestra viene chiusa (salvandone la posizione) nel blocco finally
+            speed.handle_event(event)
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_s:  # premi S per skippare
                 # uccide tutti quelli ancora vivi (non verranno considerati bene nello score)
                 for brain in population:
                     if brain.alive and not brain.completed:
                         brain.alive = False
                         brain.score -= 1000  # penalità forte per evitare che vengano scelti
+                return
 
-                running = False
-                        
-            if event.type == pygame.QUIT:
-                sys.exit()  # La finestra viene chiusa (salvandone la posizione) nel blocco finally
+        # Più passi di simulazione per frame quando la velocità è sopra x1
+        for _ in range(speed.steps_per_frame):
+            active = [b for b in population if b.alive and not b.completed]
+            if not active:
+                break
+            frame_count += 1
+            for brain in active:
+                if step_brain(brain, track, gates):
+                    finish_count += 1
+                    premio_posizione = max(1000, 10000 - (finish_count - 1) * 1000)
+                    # Tempo riportato a una pista di lunghezza standard, così il premio vale anche sulle piste lunghe
+                    premio_velocita = max(500, 5000 - frame_count * REFERENCE_GATES / len(gates))
+                    brain.score += (premio_posizione + premio_velocita) * brain.sector_weights[-1]
+                    print(f"PILOTA {population.index(brain)} ARRIVATO! Posizione: {finish_count}")
 
         screen.blit(background, (0, 0))
         alive_count = 0
-
         for brain in population:
-            if not brain.alive or brain.completed:
-                continue
+            if brain.alive and not brain.completed:
+                alive_count += 1
+                pygame.draw.circle(screen, (255, 0, 0), (int(brain.pos.x * scale), int(brain.pos.y * scale)), 4)
 
-            alive_count += 1
-            sensors = get_sensors(brain.pos, brain.angle, track)
-            nav = navigation_inputs(brain.pos, brain.angle, gates, brain.next_cp)
-            action = brain.predict(sensors, nav)
-
-            steer_raw, speed_raw = action[0], action[1]
-            old_pos = brain.pos.copy()
-
-            # --- FISICA UNIFICATA ---
-            brain.angle, brain.velocity = compute_step(
-                angle=brain.angle,
-                velocity=brain.velocity,
-                steer_raw=steer_raw,
-                speed_raw=speed_raw,
-                confidence=brain.confidence
-            )
-
-            # Movimento reale
-            rad = math.radians(brain.angle)
-            brain.pos += pygame.Vector2(math.cos(rad), math.sin(rad)) * brain.velocity
-
-            # Anti-incastro
-            if old_pos.distance_to(brain.pos) < 0.5:
-                brain.stuck_timer += 1
-            else:
-                brain.stuck_timer = 0
-
-            if brain.stuck_timer > 20:
-                brain.score -= 20
-                brain.angle += random.uniform(-30, 30)
-                brain.stuck_timer = 0
-
-            # Punteggio di avanzamento e stabilità
-            brain.score += old_pos.distance_to(brain.pos) * 0.5
-            brain.score += (1.0 - abs(steer_raw)) * 0.1
-            brain.score -= brain.velocity * 0.01
-
-            # --- CONTROLLO ATTRAVERSAMENTO CHECKPOINT (GATE INTERSECTION) ---
-            if brain.next_cp < len(gates):
-                passed, wrong_way = gates.check_progress(old_pos, brain.pos, brain.next_cp)
-
-                if wrong_way:
-                    # Ha attraversato un gate fuori sequenza: strada sbagliata a un incrocio
-                    brain.alive = False
-                    brain.score -= WRONG_GATE_PENALTY
-                elif passed:
-                    sector_idx = brain.next_cp
-                    base_reward = 8000
-                    weighted_reward = base_reward * brain.sector_weights[sector_idx]
-                    brain.score += weighted_reward
-                    
-                    # Tracciamento per pesi adattivi
-                    brain.cp_crossed_flags[sector_idx] = 1
-                    brain.next_cp += 1
-                    brain.frames_since_cp = 0
-
-                    if brain.next_cp >= len(gates):
-                        finish_count += 1
-                        brain.completed = True
-                        premio_posizione = max(1000, 10000 - (finish_count - 1) * 1000)
-                        premio_velocita = max(500, 5000 - frame_count)
-                        brain.score += (premio_posizione + premio_velocita) * brain.sector_weights[-1]
-                        print(f"PILOTA {population.index(brain)} ARRIVATO! Posizione: {finish_count}")
-                        
-            else:
-                # Caso di sicurezza: se per qualche motivo l'indice è già fuori, completa
-                brain.completed = True
-
-            # Chi non raggiunge il checkpoint successivo in tempo (es. gira in tondo) viene eliminato,
-            # altrimenti la generazione non terminerebbe mai
-            brain.frames_since_cp += 1
-            if not brain.completed and brain.frames_since_cp > MAX_FRAMES_WITHOUT_CP:
-                brain.alive = False
-
-            # --- COLLISIONE ---
-            try:
-                pixel = track.get_at((int(brain.pos.x), int(brain.pos.y)))
-                # Un muro è nero: Rosso < 30, Verde < 30, Blu < 30
-                if brain.alive and pixel.r < 30 and pixel.g < 30 and pixel.b < 30:
-                    brain.alive = False
-
-                    # penalità base
-                    brain.score -= 50
-
-                    # penalità proporzionale alla velocità
-                    brain.score -= brain.velocity * 20
-            except IndexError:
-                brain.alive = False
-
-            color = (255, 0, 0) if brain.alive else (100, 100, 100)
-            pygame.draw.circle(screen, color, (int(brain.pos.x), int(brain.pos.y)), 4)
+        # Disegno info
+        txt = font.render(f"Gen: {generation} | Vivi: {alive_count} | Arrivati: {finish_count} | "
+                          f"{speed.label()} | S = salta generazione", True, (0, 255, 0))
+        screen.blit(txt, (10, 10))
+        pygame.display.flip()
+        speed.tick(clock)
 
         # Se tutti sono morti o hanno finito, chiudiamo la generazione
         if alive_count == 0:
-            running = False
-
-        # Disegno info
-        txt = font.render(f"Gen: {generation} | Vivi: {alive_count} | Arrivati: {finish_count}", True, (0,255,0))
-        screen.blit(txt, (10, 10))
-        pygame.display.flip()
-        clock.tick(240) # Frame rate alto per velocizzare l'allenamento visivo
+            return
 
 # --- EVOLUZIONE ---
 def evolve(population, spawn_pos, base_angle, sector_weights):
@@ -288,6 +297,7 @@ def main():
     pygame.init()
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Arial", 20)
+    speed = SpeedControl(base_fps=240)  # Rimane impostata tra una generazione e l'altra
 
     # Caricamento pista: immagine, spawn e gate in ordine di percorrenza
     try:
@@ -297,14 +307,16 @@ def main():
         return
     print(f"Pista '{TRACK_NAME}' caricata: {len(gates)} gate")
     restore_window_position(WINDOW_KEY)
-    screen = pygame.display.set_mode(track_temp.get_size())
+    scale = view_scale(track_temp.get_size())  # Le piste grandi vengono mostrate ridotte
+    screen = pygame.display.set_mode((round(track_temp.get_width() * scale), round(track_temp.get_height() * scale)))
     pygame.display.set_caption(f"Training IA - {TRACK_NAME}")
     track = track_temp.convert()
 
     # Sfondo con i gate disegnati (solo grafica: i sensori leggono l'immagine pulita)
     background = track.copy()
     for a, b in gates.gates:
-        pygame.draw.line(background, (120, 160, 255), a, b, 1)
+        pygame.draw.line(background, (120, 160, 255), a, b, 2)
+    background = scaled_view(background, scale)
 
     # --- NUOVO: Calcola i pesi dei settori ---
     sector_weights = compute_sector_weights(gates.gates, spawn_pos)
@@ -328,7 +340,7 @@ def main():
         ]
 
     while True:
-        run_simulation(population, track, background, screen, clock, font, generation, spawn_pos, base_angle, gates)
+        run_simulation(population, track, background, scale, screen, clock, font, generation, spawn_pos, base_angle, gates, speed)
         
         # Salva il migliore (la popolazione va ordinata per punteggio prima di scegliere)
         population.sort(key=lambda b: b.score, reverse=True)

@@ -18,6 +18,23 @@ SENSOR_COUNT = 5
 NAV_INPUTS = 2                         # Navigatore: seno e coseno dell'angolo verso i prossimi gate
 INPUT_COUNT = SENSOR_COUNT + NAV_INPUTS
 
+# Le piste possono essere più grandi della finestra: la simulazione lavora in pixel di "mondo"
+# (immagine della pista), la finestra mostra una versione ridotta.
+MAX_WINDOW_SIZE = (1600, 900)
+
+
+def view_scale(world_size):
+    """Fattore di scala mondo -> finestra (1 se la pista entra già nella finestra)."""
+    return min(1.0, MAX_WINDOW_SIZE[0] / world_size[0], MAX_WINDOW_SIZE[1] / world_size[1])
+
+
+def scaled_view(surface, scale):
+    """Versione ridotta di una superficie per la finestra."""
+    if scale == 1.0:
+        return surface.copy()
+    size = (round(surface.get_width() * scale), round(surface.get_height() * scale))
+    return pygame.transform.smoothscale(surface, size)
+
 
 def track_image_path(name):
     return f"{name}.png"
@@ -25,6 +42,22 @@ def track_image_path(name):
 
 def track_config_path(name):
     return os.path.join("tracks_config", f"{name}.pkl")
+
+
+def list_tracks():
+    """Nomi delle piste complete (configurazione + immagine), in ordine alfabetico."""
+    if not os.path.isdir("tracks_config"):
+        return []
+    names = [f[:-4] for f in os.listdir("tracks_config") if f.endswith(".pkl")]
+    return sorted(n for n in names if os.path.exists(track_image_path(n)))
+
+
+def next_free_track_name(base):
+    """Primo nome libero del tipo base_1, base_2, ... (per non sovrascrivere piste esistenti)."""
+    i = 1
+    while os.path.exists(track_config_path(f"{base}_{i}")):
+        i += 1
+    return f"{base}_{i}"
 
 
 # --- GEOMETRIA DEL TRACCIATO ---

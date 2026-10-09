@@ -2,10 +2,16 @@
 """
 Generatore automatico di piste per training.py e simulation.py.
 
-Senza incroci la pista è una curva chiusa casuale (somma di armoniche). Con gli incroci
-è una "cinghia" avvolta su una catena di cerchi, percorsa all'andata e al ritorno: ogni
-volta che due cerchi consecutivi sono avvolti in verso opposto le due tangenti tra loro
-si incrociano. Così il raggio minimo di curva è garantito e gli incroci cadono sui rettilinei.
+Le piste sono "cinghie" avvolte su cerchi (pulegge): il raggio minimo di curva è garantito
+dai cerchi e tra un cerchio e l'altro ci sono rettilinei.
+- Anello: cerchi sparsi nell'immagine e percorsi in ordine; i cerchi avvolti al contrario
+  creano rientranze, tornanti e chicane.
+- Catena: cerchi in fila percorsi all'andata e al ritorno; ogni volta che due cerchi
+  consecutivi sono avvolti in verso opposto le due tangenti tra loro si incrociano.
+Tra alcune piste valide viene tenuta la più tortuosa.
+
+Le piste sono grandi WIDTH x HEIGHT pixel (più della finestra): training e gara le mostrano ridotte,
+mentre auto e sensori lavorano alla grandezza reale.
 
 Gli incroci sono quasi perpendicolari e su tratti dritti; i gate vicini agli incroci vengono
 omessi e chi imbocca la strada sbagliata attraversa un gate fuori sequenza e viene eliminato,
@@ -13,12 +19,13 @@ quindi l'evoluzione premia chi segue il navigatore e tira dritto.
 
 Uso:
     python generate_track.py                          anteprima interattiva
+    python generate_track.py --salva --quante 5       genera e salva 5 piste (pista_auto_1, _2, ...)
     python generate_track.py --nome pista_x --incroci 2 --seed 42 --salva
 
 Comandi dell'anteprima:
     SPAZIO = nuova pista    0-2 = numero di incroci    R = incroci casuali
-    INVIO = salva           ESC = esci
-Poi: python training.py <nome>   e   python simulation.py <nome>
+    INVIO = salva (ogni pista con un nuovo nome)     ESC = esci
+Poi: python training.py <nome> per ogni pista, e python simulation.py per il campionato su tutte.
 """
 import argparse
 import math
@@ -28,12 +35,12 @@ import numpy as np
 import pygame
 
 from track import (TRACK_WIDTH, GATE_SPACING, NEIGHBOR_ARC, TrackPath,
-                   build_checkpoint_gates, save_track)
+                   build_checkpoint_gates, save_track, next_free_track_name, view_scale, scaled_view)
 from window_state import restore_window_position, close_window
 
-WIDTH, HEIGHT = 1600, 900
+WIDTH, HEIGHT = 2400, 1350       # Grandezza reale della pista (la finestra la mostra ridotta)
 WINDOW_KEY = "generate_track"
-DEFAULT_NAME = "pista_auto"
+DEFAULT_NAME = "pista_auto"   # Le piste salvate si chiamano pista_auto_1, pista_auto_2, ...
 
 MARGIN = TRACK_WIDTH            # Distanza minima della linea centrale dal bordo dell'immagine
 STEP = 4                        # Passo di campionamento del tracciato (px)
@@ -41,7 +48,7 @@ COARSE_EVERY = 3                # Per i controlli O(n²) si usa un punto ogni 3 
 CURVATURE_WINDOW = 10           # Campioni su cui si misura la curvatura (40 px)
 MIN_RADIUS = 100                # Raggio minimo di curva percorribile dalle auto
 MIN_CROSS_ANGLE = 60            # Gradi: incroci quasi perpendicolari, la strada giusta è "dritto"
-MAX_CROSSINGS = 2               # Con più incroci non c'è spazio in 1600x900 rispettando i vincoli
+MAX_CROSSINGS = 2               # Con più incroci non c'è spazio rispettando i vincoli
 CROSS_ZONE = 220                # Raggio attorno a un incrocio in cui i due tratti possono avvicinarsi
 CROSS_STRAIGHT_ZONE = 130       # Tratto prima e dopo un incrocio che deve essere quasi dritto...
 CROSS_STRAIGHT_RADIUS = 300     # ...cioè con raggio di curva almeno questo
@@ -50,8 +57,10 @@ MIN_CROSS_DIST = 400            # Distanza minima tra due incroci
 SPAWN_CLEARANCE = 400           # Distanza minima dello spawn dagli incroci
 SPAWN_STRAIGHT_RADIUS = 350     # Lo spawn va su un tratto quasi dritto
 FINISH_OFFSET = 30              # Traguardo (ultimo gate) poco prima dello spawn
-MIN_LENGTH, MAX_LENGTH = 2800, 9000
+MIN_LENGTH, MAX_LENGTH = 5000, 14000
 MAX_ATTEMPTS = 20000
+CANDIDATES = 4                  # Piste valide tra cui scegliere la più tortuosa
+EXTRA_ATTEMPTS = 1500           # Tentativi concessi dopo la prima pista valida per trovarne altre
 
 
 class GeneratedTrack:
@@ -63,29 +72,24 @@ class GeneratedTrack:
         self.gates = gates
         self.crossings = crossings      # Lista di (x, y, angolo in gradi)
         self.length = TrackPath(points).length
+        self.complexity = complexity(points)
         self.surface = render_track(points, gates[-1])
+        self.preview = None             # Anteprima ridotta per la finestra, creata al primo disegno
+        self.saved_as = None
 
 
 # --- GENERAZIONE ---
-def fit_to_image(pts, stretch):
-    """Centra la curva nell'immagine. stretch=True la deforma per riempirla, altrimenti scala uniforme."""
+def fit_to_image(pts, stretch, max_scale=None):
+    """
+    Centra la curva nell'immagine. stretch=True la deforma per riempirla, altrimenti scala uniforme.
+    max_scale limita l'ingrandimento (ingrandire allarga le curve e rende la pista più semplice).
+    """
     lo, hi = pts.min(axis=0), pts.max(axis=0)
     box = np.array([WIDTH - 2 * MARGIN, HEIGHT - 2 * MARGIN], dtype=float)
     scale = box / (hi - lo) if stretch else (box / (hi - lo)).min()
+    if max_scale is not None:
+        scale = np.minimum(scale, max_scale)
     return (pts - (lo + hi) / 2) * scale + np.array([WIDTH, HEIGHT]) / 2
-
-
-def harmonic_curve(rng, n=720):
-    """Curva chiusa senza incroci: ellisse deformata da armoniche casuali deboli."""
-    t = np.linspace(0, 2 * np.pi, n, endpoint=False)
-    strength = rng.uniform(0.15, 0.45)
-    x = np.cos(t) * rng.uniform(0.8, 1.2)
-    y = np.sin(t) * rng.uniform(0.8, 1.2)
-    for k in range(2, int(rng.integers(2, 5)) + 1):
-        amp = strength / k ** 0.7
-        x += amp * (rng.normal() * np.cos(k * t) + rng.normal() * np.sin(k * t))
-        y += amp * (rng.normal() * np.cos(k * t) + rng.normal() * np.sin(k * t))
-    return fit_to_image(np.column_stack([x, y]), stretch=True)
 
 
 def belt_tangent(c1, r1, s1, c2, r2, s2):
@@ -139,8 +143,8 @@ def chain_curve(rng, crossings):
     Catena di cerchi disposta in orizzontale e percorsa andata e ritorno.
     Ogni collegamento tra cerchi avvolti in verso opposto produce esattamente un incrocio.
     """
-    m = crossings + 1 + int(rng.integers(0, 2))
-    radii = rng.uniform(MIN_RADIUS * 1.05, 200, m)
+    m = crossings + 1 + int(rng.integers(1, 4))
+    radii = rng.uniform(MIN_RADIUS * 1.05, 180, m)
     flips = np.zeros(m - 1, dtype=bool)
     flips[rng.choice(m - 1, crossings, replace=False)] = True
     signs = np.ones(m)
@@ -150,7 +154,7 @@ def chain_curve(rng, crossings):
     centers = [np.zeros(2)]
     heading = rng.uniform(-0.25, 0.25)
     for k in range(1, m):
-        heading += rng.uniform(-0.5, 0.5)
+        heading += rng.uniform(-0.6, 0.6)
         if flips[k - 1]:
             # Distanza tra 1.7 e 2 volte la somma dei raggi: incrocio tra 60° e 72°
             dist = rng.uniform(1.7, 2.0) * (radii[k - 1] + radii[k])
@@ -166,11 +170,52 @@ def chain_curve(rng, crossings):
 
     sequence = list(range(m)) + list(range(m - 2, 0, -1))
     pts = belt_path(centers, radii, signs, sequence)
-    return None if pts is None else fit_to_image(pts, stretch=False)
+    return None if pts is None else fit_to_image(pts, stretch=False, max_scale=1.0)
+
+
+def ring_curve(rng):
+    """
+    Anello di cerchi sparsi nell'immagine, percorsi in ordine attorno al centro.
+    I cerchi interni vengono spesso avvolti al contrario: la pista rientra verso il centro
+    formando tornanti e chicane (e a volte incroci).
+    """
+    m = int(rng.integers(8, 13))
+    radii = rng.uniform(MIN_RADIUS * 1.05, 180, m)
+    centers = np.empty((0, 2))
+    for k, r in enumerate(radii):
+        # 200 posizioni candidate in un colpo solo: si tiene la prima abbastanza lontana dagli altri cerchi
+        cand = np.column_stack([rng.uniform(MARGIN + r, WIDTH - MARGIN - r, 200),
+                                rng.uniform(MARGIN + r, HEIGHT - MARGIN - r, 200)])
+        if len(centers):
+            gaps = np.hypot(*(cand[:, None, :] - centers[None, :, :]).transpose(2, 0, 1)) - r - radii[:k]
+            free = np.flatnonzero((gaps >= 2 * TRACK_WIDTH).all(axis=1))
+            if len(free) == 0:
+                return None
+            cand = cand[free]
+        centers = np.vstack([centers, cand[:1]])
+
+    mid = centers.mean(axis=0)
+    order = list(np.argsort(np.arctan2(centers[:, 1] - mid[1], centers[:, 0] - mid[0])))
+    dist = np.hypot(*(centers - mid).T)
+    inner = 1 - (dist - dist.min()) / (np.ptp(dist) + 1e-9)   # 1 = cerchio più vicino al centro
+    signs = np.where(rng.random(m) < 0.6 * (0.3 + inner), -1.0, 1.0)
+    return belt_path(centers, radii, signs, order)
 
 
 def candidate_curve(rng, crossings):
-    return harmonic_curve(rng) if crossings == 0 else chain_curve(rng, crossings)
+    # L'anello dà le piste più tortuose ma raramente il numero esatto di incroci:
+    # ogni tanto si prova la catena, che li garantisce
+    if crossings == 0 or rng.random() < 0.9:
+        return ring_curve(rng)
+    return chain_curve(rng, crossings)
+
+
+def complexity(pts):
+    """Quanto è tortuosa la pista: sterzata totale in giri completi (un ovale vale 1)."""
+    seg = np.roll(pts, -1, axis=0) - pts
+    heading = np.arctan2(seg[:, 1], seg[:, 0])
+    turn = (np.roll(heading, -1) - heading + np.pi) % (2 * np.pi) - np.pi
+    return float(np.abs(turn).sum() / (2 * np.pi))
 
 
 def resample(points, step):
@@ -298,14 +343,25 @@ def generate_track(seed=None, crossings=None):
         crossings = int(rng.choice([0, 1, 1, 2, 2]))
     crossings = min(crossings, MAX_CROSSINGS)
 
-    for _ in range(MAX_ATTEMPTS):
+    valid = []
+    first_valid_at = None
+    for attempt in range(MAX_ATTEMPTS):
+        if first_valid_at is not None and attempt - first_valid_at > EXTRA_ATTEMPTS:
+            break
         raw = candidate_curve(rng, crossings)
         if raw is None:
             continue
         result = evaluate(raw, rng)
         if result is None or len(result[2]) != crossings:
             continue
-        pts, spawn_idx, found = result
+        valid.append(result)
+        if first_valid_at is None:
+            first_valid_at = attempt
+        if len(valid) >= CANDIDATES:
+            break
+
+    if valid:
+        pts, spawn_idx, found = max(valid, key=lambda res: complexity(res[0]))
 
         # La pista parte dallo spawn; il verso di marcia è casuale
         pts = np.roll(pts, -spawn_idx, axis=0)
@@ -336,35 +392,50 @@ def render_track(points, finish_gate):
     return surf
 
 
+def target_name(explicit_name):
+    """Nome scelto dall'utente, altrimenti il primo pista_auto_N libero."""
+    return explicit_name or next_free_track_name(DEFAULT_NAME)
+
+
 def save_generated(track, name):
     save_track(name, track.surface, track.spawn_pos, -track.spawn_angle, track.gates,
                gates_ordered=True, seed=track.seed, crossings=track.crossings)
+    track.saved_as = name
     print(f"Pista salvata: {name}.png + tracks_config/{name}.pkl "
           f"(seed {track.seed}, {len(track.crossings)} incroci, {len(track.gates)} gate)")
-    print(f"Allenamento: python training.py {name}   |   Gara: python simulation.py {name}")
+    print(f"  Allenamento: python training.py {name}")
 
 
 # --- ANTEPRIMA INTERATTIVA ---
-def draw_preview(screen, font, track, crossings_setting, name, message):
-    screen.blit(track.surface, (0, 0))
-
+def build_preview(track):
+    """Pista con gate, incroci e partenza, ridotta alla grandezza della finestra."""
+    surf = track.surface.copy()
     for i, (a, b) in enumerate(track.gates):
         color = (0, 200, 0) if i == len(track.gates) - 1 else (70, 130, 255)
-        pygame.draw.line(screen, color, a, b, 2)
+        pygame.draw.line(surf, color, a, b, 3)
 
     for x, y, _ in track.crossings:
-        pygame.draw.circle(screen, (255, 200, 0), (int(x), int(y)), TRACK_WIDTH, 2)
+        pygame.draw.circle(surf, (255, 200, 0), (int(x), int(y)), TRACK_WIDTH, 3)
 
     rad = math.radians(track.spawn_angle)
     start = pygame.Vector2(track.spawn_pos)
-    pygame.draw.line(screen, (0, 255, 0), start, start + pygame.Vector2(math.cos(rad), math.sin(rad)) * 60, 6)
-    pygame.draw.circle(screen, (0, 255, 0), start, 10)
+    pygame.draw.line(surf, (0, 255, 0), start, start + pygame.Vector2(math.cos(rad), math.sin(rad)) * 80, 8)
+    pygame.draw.circle(surf, (0, 255, 0), start, 14)
+    return scaled_view(surf, view_scale(surf.get_size()))
+
+
+def draw_preview(screen, font, track, crossings_setting, save_name, message):
+    if track.preview is None:
+        track.preview = build_preview(track)
+    screen.blit(track.preview, (0, 0))
 
     setting = "casuali" if crossings_setting is None else str(crossings_setting)
     lines = [
         f"Seed {track.seed} | Incroci {len(track.crossings)} (impostazione: {setting}) | "
-        f"Lunghezza {track.length:.0f} px | Gate {len(track.gates)}",
-        f"SPAZIO nuova pista | 0-{MAX_CROSSINGS} incroci | R casuali | INVIO salva come '{name}' | ESC esci",
+        f"Lunghezza {track.length:.0f} px | Tortuosità {track.complexity:.1f} | Gate {len(track.gates)}",
+        f"SPAZIO nuova pista | 0-{MAX_CROSSINGS} incroci | R casuali | "
+        + (f"Salvata come '{track.saved_as}'" if track.saved_as else f"INVIO salva come '{save_name}'")
+        + " | ESC esci",
     ]
     if message:
         lines.append(message)
@@ -379,13 +450,14 @@ def draw_preview(screen, font, track, crossings_setting, name, message):
 def show_generating(screen, font):
     img = font.render("Generazione pista...", True, (255, 255, 0))
     screen.fill((0, 0, 0))
-    screen.blit(img, ((WIDTH - img.get_width()) // 2, HEIGHT // 2))
+    screen.blit(img, ((screen.get_width() - img.get_width()) // 2, screen.get_height() // 2))
     pygame.display.flip()
 
 
 def run_preview(name, crossings, seed):
     restore_window_position(WINDOW_KEY)
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    scale = view_scale((WIDTH, HEIGHT))
+    screen = pygame.display.set_mode((round(WIDTH * scale), round(HEIGHT * scale)))
     pygame.display.set_caption("Generatore di piste")
     font = pygame.font.SysFont("Arial", 18, bold=True)
     clock = pygame.time.Clock()
@@ -409,32 +481,43 @@ def run_preview(name, crossings, seed):
                 crossings, regenerate = None, True
             elif pygame.K_0 <= event.key <= pygame.K_0 + MAX_CROSSINGS:
                 crossings, regenerate = event.key - pygame.K_0, True
-            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                save_generated(track, name)
-                message = f"Salvata come '{name}'. Allena con: python training.py {name}"
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and not track.saved_as:
+                saved = target_name(name)
+                save_generated(track, saved)
+                message = (f"Salvata come '{saved}'. Allena con: python training.py {saved} | "
+                           f"Campionato su tutte le piste: python simulation.py")
 
         if regenerate:
             show_generating(screen, font)
             track = generate_track(None, crossings)
             message = ""
 
-        draw_preview(screen, font, track, crossings, name, message)
+        draw_preview(screen, font, track, crossings, target_name(name), message)
         pygame.display.flip()
         clock.tick(30)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generatore automatico di piste")
-    parser.add_argument("--nome", default=DEFAULT_NAME, help=f"nome della pista (default: {DEFAULT_NAME})")
+    parser.add_argument("--nome", default=None,
+                        help=f"nome della pista (default: {DEFAULT_NAME}_1, {DEFAULT_NAME}_2, ... senza sovrascrivere)")
     parser.add_argument("--incroci", type=int, choices=range(0, MAX_CROSSINGS + 1), default=None,
                         help=f"numero di incroci (default: casuale tra 0 e {MAX_CROSSINGS})")
     parser.add_argument("--seed", type=int, default=None, help="seme per riprodurre una pista")
     parser.add_argument("--salva", action="store_true", help="genera e salva senza anteprima")
+    parser.add_argument("--quante", type=int, default=1, help="con --salva: quante piste generare (default: 1)")
     args = parser.parse_args()
 
     pygame.init()
     if args.salva:
-        save_generated(generate_track(args.seed, args.incroci), args.nome)
+        for i in range(max(1, args.quante)):
+            seed = None if args.seed is None else args.seed + i
+            if args.nome and args.quante > 1:
+                name = next_free_track_name(args.nome)
+            else:
+                name = target_name(args.nome)
+            save_generated(generate_track(seed, args.incroci), name)
+        print("Campionato su tutte le piste: python simulation.py")
     else:
         run_preview(args.nome, args.incroci, args.seed)
 
