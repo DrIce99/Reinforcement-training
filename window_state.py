@@ -51,26 +51,28 @@ def _get_window_position():
         return None
 
 
-def restore_window_position(key):
-    """Da chiamare PRIMA di pygame.display.set_mode()."""
+def saved_window_position(key):
+    """Posizione salvata per `key`, oppure None se assente o fuori dallo schermo."""
     pos = _load_all().get(key)
     if (isinstance(pos, list) and len(pos) == 2
             and all(isinstance(v, int) for v in pos) and _is_on_screen(*pos)):
+        return tuple(pos)
+    return None
+
+
+def restore_window_position(key):
+    """Da chiamare PRIMA di pygame.display.set_mode()."""
+    pos = saved_window_position(key)
+    if pos is not None:
         os.environ["SDL_VIDEO_WINDOW_POS"] = f"{pos[0]},{pos[1]}"
 
 
-def save_window_position(key):
-    """Da chiamare PRIMA di pygame.quit(), finché la finestra esiste ancora."""
-    if not pygame.display.get_init() or pygame.display.get_surface() is None:
+def store_window_position(key, pos):
+    """Salva una posizione già nota (es. di una finestra che è stata chiusa)."""
+    if pos is None or pos[0] < -10000 or pos[1] < -10000:  # finestra ridotta a icona
         return
-    if not pygame.display.get_active():  # finestra ridotta a icona: posizione non significativa
-        return
-    pos = _get_window_position()
-    if pos is None:
-        return
-
     data = _load_all()
-    data[key] = list(pos)
+    data[key] = [int(pos[0]), int(pos[1])]
     temp_file = STATE_FILE + ".tmp"
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
@@ -78,6 +80,24 @@ def save_window_position(key):
         os.replace(temp_file, STATE_FILE)
     except OSError as e:
         print(f"Impossibile salvare la posizione della finestra: {e}")
+
+
+def save_window_position(key, window=None):
+    """
+    Da chiamare PRIMA di pygame.quit(), finché la finestra esiste ancora.
+    Senza `window` salva la finestra principale (pygame.display), altrimenti la pygame.Window indicata.
+    """
+    if window is not None:
+        try:
+            store_window_position(key, tuple(window.position))
+        except pygame.error:
+            pass
+        return
+    if not pygame.display.get_init() or pygame.display.get_surface() is None:
+        return
+    if not pygame.display.get_active():  # finestra ridotta a icona: posizione non significativa
+        return
+    store_window_position(key, _get_window_position())
 
 
 def close_window(key):
