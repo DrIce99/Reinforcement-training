@@ -4,39 +4,43 @@ import math
 import random
 import pickle
 import os
+import sys
 
-from physics import compute_step, check_line_intersection
+from physics import compute_step
+from track import SENSOR_COUNT, INPUT_COUNT, load_track, navigation_inputs, adapt_weights
+from window_state import restore_window_position, close_window
 
 # --- CONFIG ---
-# WIDTH, HEIGHT = 800, 600
 POP_SIZE = 60
-SENSOR_COUNT = 5
 
-TRACK_NAME = "pista_gara"
+# Uso: python training.py [nome_pista]
+TRACK_NAME = sys.argv[1] if len(sys.argv) > 1 else "pista_gara"
+WINDOW_KEY = "training"
+MAX_FRAMES_WITHOUT_CP = 1000  # Elimina chi gira a vuoto senza raggiungere il checkpoint successivo
+WRONG_GATE_PENALTY = 3000     # Strada sbagliata a un incrocio, taglio o contromano
 
 # LOGICA DI SALVATAGGIO ---
 def save_model(brain):
+    os.makedirs("tracks", exist_ok=True)
     with open(f"tracks/{TRACK_NAME}.pkl", "wb") as f:
         pickle.dump(brain.weights, f)
-    print(">>> Progresso salvato in checkpoints.pkl")
+    print(f">>> Progresso salvato in tracks/{TRACK_NAME}.pkl")
 
 def load_model():
     if os.path.exists(f"tracks/{TRACK_NAME}.pkl"):
         with open(f"tracks/{TRACK_NAME}.pkl", "rb") as f:
             print(">>> Modello precedente caricato con successo!")
-            return pickle.load(f)
+            return adapt_weights(pickle.load(f))
     return None
 
 # --- BRAIN ---
 class Brain:
     def __init__(self, spawn_pos, base_angle, weights=None, sector_weights=None):
-        self.spawn_pos = spawn_pos
-        self.base_angle = -90
         self.next_cp = 0
         
-        # Inizializza i pesi neurali: 5 sensori in ingresso, 2 decisioni in uscita
+        # Pesi neurali: 5 sensori + 2 ingressi del navigatore, 2 decisioni in uscita
         if weights is None:
-            self.weights = np.random.uniform(-1, 1, (SENSOR_COUNT, 2))
+            self.weights = np.random.uniform(-1, 1, (INPUT_COUNT, 2))
         else:
             self.weights = weights
             
@@ -67,15 +71,17 @@ class Brain:
         self.next_cp = 0
         self.completed = False
         self.velocity = 0
+        self.stuck_timer = 0
+        self.frames_since_cp = 0
         # Resetta anche i flag dei checkpoint quando si resetta il cervello
         self.cp_crossed_flags[:] = 0 
 
-    def predict(self, sensors):
-        output = np.dot(sensors, self.weights)
+    def predict(self, sensors, nav):
+        output = np.dot(np.concatenate([sensors, nav]), self.weights)
         output = np.tanh(output)
         steer = output[0]
         speed = output[1]
-        # CONFIDENCE = quanto il cervello “vede chiaro”
+        # CONFIDENCE = quanto il cervello “vede chiaro” (solo dai sensori di distanza)
         self.confidence = float(np.mean(sensors) - np.std(sensors))
         return np.array([steer, speed])
 
@@ -110,7 +116,7 @@ def get_sensors(pos, angle, track):
 
 
 # --- SIMULAZIONE ---
-def run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle, checkpoints):
+def run_simulation(population, track, background, screen, clock, font, generation, spawn_pos, base_angle, gates):
     running = True
     finish_count = 0 # Conta quanti hanno finito il giro
     frame_count = 0  # Timer della simulazione
@@ -136,9 +142,9 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
                 running = False
                         
             if event.type == pygame.QUIT:
-                pygame.quit(); exit()
+                sys.exit()  # La finestra viene chiusa (salvandone la posizione) nel blocco finally
 
-        screen.blit(track, (0, 0))
+        screen.blit(background, (0, 0))
         alive_count = 0
 
         for brain in population:
@@ -147,7 +153,8 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
 
             alive_count += 1
             sensors = get_sensors(brain.pos, brain.angle, track)
-            action = brain.predict(sensors)
+            nav = navigation_inputs(brain.pos, brain.angle, gates, brain.next_cp)
+            action = brain.predict(sensors, nav)
 
             steer_raw, speed_raw = action[0], action[1]
             old_pos = brain.pos.copy()
@@ -182,12 +189,14 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
             brain.score -= brain.velocity * 0.01
 
             # --- CONTROLLO ATTRAVERSAMENTO CHECKPOINT (GATE INTERSECTION) ---
-            if brain.next_cp < len(checkpoints):
-                gate = checkpoints[brain.next_cp]
-                p1 = (old_pos.x, old_pos.y)
-                p2 = (brain.pos.x, brain.pos.y)
+            if brain.next_cp < len(gates):
+                passed, wrong_way = gates.check_progress(old_pos, brain.pos, brain.next_cp)
 
-                if check_line_intersection(p1, p2, gate[0], gate[1]):
+                if wrong_way:
+                    # Ha attraversato un gate fuori sequenza: strada sbagliata a un incrocio
+                    brain.alive = False
+                    brain.score -= WRONG_GATE_PENALTY
+                elif passed:
                     sector_idx = brain.next_cp
                     base_reward = 8000
                     weighted_reward = base_reward * brain.sector_weights[sector_idx]
@@ -196,8 +205,9 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
                     # Tracciamento per pesi adattivi
                     brain.cp_crossed_flags[sector_idx] = 1
                     brain.next_cp += 1
+                    brain.frames_since_cp = 0
 
-                    if brain.next_cp >= len(checkpoints):
+                    if brain.next_cp >= len(gates):
                         finish_count += 1
                         brain.completed = True
                         premio_posizione = max(1000, 10000 - (finish_count - 1) * 1000)
@@ -209,19 +219,25 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
                 # Caso di sicurezza: se per qualche motivo l'indice è già fuori, completa
                 brain.completed = True
 
+            # Chi non raggiunge il checkpoint successivo in tempo (es. gira in tondo) viene eliminato,
+            # altrimenti la generazione non terminerebbe mai
+            brain.frames_since_cp += 1
+            if not brain.completed and brain.frames_since_cp > MAX_FRAMES_WITHOUT_CP:
+                brain.alive = False
+
             # --- COLLISIONE ---
             try:
                 pixel = track.get_at((int(brain.pos.x), int(brain.pos.y)))
                 # Un muro è nero: Rosso < 30, Verde < 30, Blu < 30
-                if pixel.r < 30 and pixel.g < 30 and pixel.b < 30:
+                if brain.alive and pixel.r < 30 and pixel.g < 30 and pixel.b < 30:
                     brain.alive = False
-                    
+
                     # penalità base
                     brain.score -= 50
-                    
+
                     # penalità proporzionale alla velocità
                     brain.score -= brain.velocity * 20
-            except:
+            except IndexError:
                 brain.alive = False
 
             color = (255, 0, 0) if brain.alive else (100, 100, 100)
@@ -235,7 +251,7 @@ def run_simulation(population, track, screen, clock, font, generation, spawn_pos
         txt = font.render(f"Gen: {generation} | Vivi: {alive_count} | Arrivati: {finish_count}", True, (0,255,0))
         screen.blit(txt, (10, 10))
         pygame.display.flip()
-        clock.tick(240) # Aumentato a 120 per velocizzare l'allenamento visivo
+        clock.tick(240) # Frame rate alto per velocizzare l'allenamento visivo
 
 # --- EVOLUZIONE ---
 def evolve(population, spawn_pos, base_angle, sector_weights):
@@ -270,41 +286,29 @@ def evolve(population, spawn_pos, base_angle, sector_weights):
 # --- MAIN ---
 def main():
     pygame.init()
-    # track = pygame.image.load("circuit.png").convert()
-    track_temp = pygame.image.load("pista_gara.png")
-    WIDTH, HEIGHT = track_temp.get_size()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    track = track_temp.convert()
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Arial", 20)
 
-    track = pygame.transform.scale(track, (WIDTH, HEIGHT))
-    
-    # 1. Caricamento Immagine
+    # Caricamento pista: immagine, spawn e gate in ordine di percorrenza
     try:
-        track_temp = pygame.image.load(f"{TRACK_NAME}.png")
-        WIDTH, HEIGHT = track_temp.get_size()
-        screen = pygame.display.set_mode((WIDTH, HEIGHT))
-        track = track_temp.convert()
-    except pygame.error:
-        print("Errore: Immagine pista_gara.png non trovata!")
+        track_temp, spawn_pos, base_angle, gates = load_track(TRACK_NAME)
+    except (pygame.error, FileNotFoundError, KeyError) as e:
+        print(f"Errore: impossibile caricare la pista '{TRACK_NAME}': {e}")
         return
+    print(f"Pista '{TRACK_NAME}' caricata: {len(gates)} gate")
+    restore_window_position(WINDOW_KEY)
+    screen = pygame.display.set_mode(track_temp.get_size())
+    pygame.display.set_caption(f"Training IA - {TRACK_NAME}")
+    track = track_temp.convert()
 
-    # 2. Caricamento Configurazione (Unico file necessario)
-    try:
-        with open(f"tracks_config/{TRACK_NAME}.pkl", "rb") as f:
-            config = pickle.load(f)
-        checkpoints = config["checkpoints"]
-        spawn_pos = pygame.Vector2(config["spawn_pos"])
-        base_angle = config["base_angle"]
-        print(f"Track caricato correttamente!")
-    except (FileNotFoundError, KeyError):
-        print("Errore: Il file track_config.pkl è assente o corrotto.")
-        return
+    # Sfondo con i gate disegnati (solo grafica: i sensori leggono l'immagine pulita)
+    background = track.copy()
+    for a, b in gates.gates:
+        pygame.draw.line(background, (120, 160, 255), a, b, 1)
 
     # --- NUOVO: Calcola i pesi dei settori ---
-    sector_weights = compute_sector_weights(checkpoints, spawn_pos)
-    print(f"Pesi settori iniziali: {[round(w, 2) for w in sector_weights]}")
+    sector_weights = compute_sector_weights(gates.gates, spawn_pos)
+    print(f"Pesi settori iniziali: {[round(float(w), 2) for w in sector_weights]}")
 
     generation = 0 
     saved_weights = load_model()
@@ -324,10 +328,11 @@ def main():
         ]
 
     while True:
-        run_simulation(population, track, screen, clock, font, generation, spawn_pos, base_angle, checkpoints)
+        run_simulation(population, track, background, screen, clock, font, generation, spawn_pos, base_angle, gates)
         
-        # Salva il migliore
-        save_model(population[0]) 
+        # Salva il migliore (la popolazione va ordinata per punteggio prima di scegliere)
+        population.sort(key=lambda b: b.score, reverse=True)
+        save_model(population[0])
         
         # --- NUOVO: Aggiorna i pesi in modo adattivo (opzionale, vedi punto avanzato) ---
         # sector_weights = update_adaptive_weights(sector_weights, population, POP_SIZE)
@@ -335,17 +340,6 @@ def main():
         # Passa sector_weights a evolve
         population = evolve(population, spawn_pos, base_angle, sector_weights)
         generation += 1
-
-def find_spawn(track):
-    width, height = track.get_size()
-
-    for x in range(width):
-        for y in range(height):
-            color = track.get_at((x, y))
-            if color[0] == 0 and color[1] == 255 and color[2] == 0:
-                return pygame.Vector2(x, y)
-
-    return pygame.Vector2(400, 300)  # fallback
 
 def compute_sector_weights(checkpoints, spawn_pos):
     """
@@ -381,4 +375,7 @@ def compute_sector_weights(checkpoints, spawn_pos):
     return weights
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        close_window(WINDOW_KEY)

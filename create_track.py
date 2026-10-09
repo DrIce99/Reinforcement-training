@@ -1,12 +1,16 @@
 import pygame
 import math
-import pickle
 import numpy as np
-import os
+import sys
+
+from track import TRACK_WIDTH, build_checkpoint_gates, save_track
+from window_state import restore_window_position, close_window
 
 # --- CONFIGURAZIONE ---
 WIDTH, HEIGHT = 1600, 900
-TRACK_WIDTH = 75
+WINDOW_KEY = "create_track"
+# Uso: python create_track.py [nome_pista]
+TRACK_NAME = sys.argv[1] if len(sys.argv) > 1 else "pista_gara"
 WHITE, GRAY, BLACK, RED, GREEN, BLUE = (255,255,255), (55,55,55), (0,0,0), (255,50,50), (50,255,50), (50,100,255)
 
 class ControlPoint:
@@ -24,6 +28,7 @@ class Editor:
         self.spawn_pos = pygame.Vector2(WIDTH//2, HEIGHT//2)
         self.spawn_angle = 0
         self.setting_spawn = False
+        self.aiming_spawn = False
 
     def get_bezier_points(self, steps=30):
         if len(self.points) < 2: return []
@@ -43,24 +48,32 @@ class Editor:
 
     def run(self):
         pygame.init()
+        restore_window_position(WINDOW_KEY)
         screen = pygame.display.set_mode((WIDTH, HEIGHT))
-        pygame.display.set_caption("Track Editor Pro")
+        pygame.display.set_caption(f"Track Editor Pro - {TRACK_NAME}")
         clock = pygame.time.Clock()
-        font = pygame.font.SysFont("Arial", 16, bold=True)
 
         while True:
             m_pos = pygame.Vector2(pygame.mouse.get_pos())
             for event in pygame.event.get():
                 if event.type == pygame.QUIT: return
-                if event.type == pygame.MOUSEBUTTONDOWN:
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if self.setting_spawn:
+                        # Click = posizione dello spawn, trascinamento = direzione
+                        self.spawn_pos = pygame.Vector2(m_pos)
+                        self.aiming_spawn = True
+                        continue
                     for p in self.points:
                         if m_pos.distance_to(p.pos) < 15: p.dragging = "pos"; break
                         if m_pos.distance_to(p.h_in) < 10: p.dragging = "in"; break
                         if m_pos.distance_to(p.h_out) < 10: p.dragging = "out"; break
                     else:
-                        if not self.setting_spawn: self.points.append(ControlPoint(m_pos.x, m_pos.y))
-                if event.type == pygame.MOUSEBUTTONUP:
+                        self.points.append(ControlPoint(m_pos.x, m_pos.y))
+                if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                     for p in self.points: p.dragging = None
+                    if self.aiming_spawn:
+                        self.aiming_spawn = False
+                        self.setting_spawn = False
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_c: self.closed = not self.closed
                     if event.key == pygame.K_l:
@@ -80,11 +93,10 @@ class Editor:
                     p.h_out = pygame.Vector2(m_pos)
                     if p.locked_handles: p.h_in = p.pos + (p.pos - p.h_out)
 
-            if self.setting_spawn:
-                if pygame.mouse.get_pressed()[0]: self.spawn_pos = pygame.Vector2(m_pos)
+            if self.aiming_spawn:
                 diff = m_pos - self.spawn_pos
+                # Angolo in convenzione matematica (y verso l'alto), come salvato nel file di configurazione
                 if diff.length() > 5: self.spawn_angle = math.degrees(math.atan2(-diff.y, diff.x))
-                if event.type == pygame.MOUSEBUTTONUP: self.setting_spawn = False
 
             screen.fill((0, 0, 0))
             bezier_pts = self.get_bezier_points(steps=30)
@@ -108,46 +120,22 @@ class Editor:
             clock.tick(60)
 
     def save_all(self):
-        if not os.path.exists("tracks_config"): os.makedirs("tracks_config")
         pts = self.get_bezier_points(steps=80)
-        
+
         surf = pygame.Surface((WIDTH, HEIGHT))
         surf.fill((0, 0, 0))
-        
+
         if len(pts) > 1:
-            for p in pts: 
+            for p in pts:
                 pygame.draw.circle(surf, (255, 255, 255), (int(p[0]), int(p[1])), TRACK_WIDTH // 2)
             self.draw_finish_line(surf, self.spawn_pos, self.spawn_angle, color=(0, 255, 0), width=12)
 
-        # --- CALCOLO CHECKPOINT GATE (Segmenti Perpendicolari) ---
-        checkpoint_gates = []
-        step_cp = 20
-        gate_width = TRACK_WIDTH - 10  # Più stretto per evitare tagli agli incroci
-        
-        for i in range(0, len(pts), step_cp):
-            p_curr = pygame.Vector2(pts[i])
-            p_next = pygame.Vector2(pts[(i + 1) % len(pts)])
-            
-            direction = (p_next - p_curr)
-            if direction.length_squared() > 0:
-                direction = direction.normalize()
-            else:
-                direction = pygame.Vector2(1, 0)
-                
-            normal = pygame.Vector2(-direction.y, direction.x)
-            g_start = p_curr + normal * (gate_width / 2)
-            g_end = p_curr - normal * (gate_width / 2)
-            
-            checkpoint_gates.append(((g_start.x, g_start.y), (g_end.x, g_end.y)))
+        # Gate perpendicolari al tracciato; quelli negli incroci vengono omessi.
+        # L'ordine rispetto allo spawn viene sistemato al caricamento.
+        checkpoint_gates = build_checkpoint_gates(pts, closed=self.closed) if len(pts) > 1 else []
 
-        pygame.image.save(surf, "pista_gara.png")
-        with open("tracks_config/pista_gara.pkl", "wb") as f:
-            pickle.dump({
-                "checkpoints": checkpoint_gates, 
-                "spawn_pos": (self.spawn_pos.x, self.spawn_pos.y), 
-                "base_angle": self.spawn_angle
-            }, f)
-        print("Salvataggio completato: Immagine e checkpoint gate salvati.")
+        save_track(TRACK_NAME, surf, self.spawn_pos, self.spawn_angle, checkpoint_gates)
+        print(f"Salvataggio completato: {TRACK_NAME}.png e {len(checkpoint_gates)} gate salvati.")
 
     def draw_finish_line(self, surface, pos, angle, color=(0, 255, 0), width=10):
         """Disegna la linea di traguardo perpendicolare alla direzione"""
@@ -160,4 +148,8 @@ class Editor:
         return l_start, l_end # Utile per calcolare hitbox se necessario
 
 if __name__ == "__main__":
-    Editor().run()
+    try:
+        Editor().run()
+    finally:
+        close_window(WINDOW_KEY)
+
